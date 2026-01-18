@@ -1,0 +1,42 @@
+[package]
+name = "geoprint3d-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Geospatial
+geo = "0.28"
+geojson = "0.24"
+proj = "0.27"  # Coordinate projection (PROJ library)
+
+# 3D mesh generation
+nalgebra = "0.32"
+delaunator = "1.0"  # Delaunay triangulation
+
+# STL export
+stl_io = "0.7"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.5"
+
+# Async
+futures = "0.3"
+
+[dev-dependencies]
