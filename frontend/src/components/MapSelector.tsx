@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { MapContainer, TileLayer, Rectangle, useMapEvents } from 'react-leaflet';
-import type { LatLngBounds } from 'leaflet';
+import L, { type LatLngBounds } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { BoundingBox } from '../types';
 
@@ -14,35 +14,13 @@ function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: Boundi
   const [isSelecting, setIsSelecting] = useState(false);
   const [modifierPressed, setModifierPressed] = useState(false);
 
-  // Listen for modifier key press/release globally
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey) {
-        setModifierPressed(true);
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (!e.metaKey && !e.ctrlKey) {
-        setModifierPressed(false);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, []);
-
   const map = useMapEvents({
     mousedown: (e) => {
       // Only start selection if Command (Mac) or Ctrl (Windows/Linux) is pressed
       const originalEvent = e.originalEvent as MouseEvent;
       if (originalEvent.metaKey || originalEvent.ctrlKey) {
-        e.originalEvent.preventDefault(); // Prevent default map behavior
+        e.originalEvent.preventDefault();
+        map.dragging.disable(); // Disable map dragging during selection
         setIsSelecting(true);
         setStartPoint({ lat: e.latlng.lat, lng: e.latlng.lng });
         setBounds(null);
@@ -56,13 +34,13 @@ function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: Boundi
           [e.latlng.lat, e.latlng.lng],
         ] as [[number, number], [number, number]];
 
-        const boundsObj = map.latLngBounds(newBounds);
+        const boundsObj = L.latLngBounds(newBounds);
         setBounds(boundsObj);
       }
     },
     mouseup: (e) => {
       if (isSelecting && startPoint) {
-        const finalBounds = map.latLngBounds([
+        const finalBounds = L.latLngBounds([
           [startPoint.lat, startPoint.lng],
           [e.latlng.lat, e.latlng.lng],
         ]);
@@ -70,8 +48,8 @@ function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: Boundi
         // Calculate area
         const area = calculateArea(finalBounds);
 
-        if (area > 1.0) {
-          alert(`Selected area (${area.toFixed(2)} km²) exceeds 1 km² limit. Please select a smaller area.`);
+        if (area > 20.0) {
+          alert(`Selected area (${area.toFixed(2)} km²) exceeds 20 km² limit. Please select a smaller area.`);
           setBounds(null);
           onBoundsChange(null);
         } else {
@@ -86,9 +64,37 @@ function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: Boundi
 
         setStartPoint(null);
         setIsSelecting(false);
+        map.dragging.enable(); // Re-enable map dragging after selection
       }
     },
   });
+
+  // Listen for modifier key press/release globally
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey) {
+        setModifierPressed(true);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (!e.metaKey && !e.ctrlKey) {
+        setModifierPressed(false);
+        // Re-enable dragging if user releases modifier without completing selection
+        if (!isSelecting) {
+          map.dragging.enable();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [map, isSelecting]);
 
   // Calculate approximate area in km²
   function calculateArea(bounds: LatLngBounds): number {
@@ -156,7 +162,7 @@ export default function MapSelector({ onBoundsChange }: MapSelectorProps) {
         <ol className="text-xs space-y-1 text-gray-700">
           <li>1. Hold <kbd className="px-1 py-0.5 bg-gray-200 rounded text-xs font-mono">⌘ Cmd</kbd> (Mac) or <kbd className="px-1 py-0.5 bg-gray-200 rounded text-xs font-mono">Ctrl</kbd> (Windows)</li>
           <li>2. Click and drag to define bounding box</li>
-          <li>3. Release to confirm (max 1 km²)</li>
+          <li>3. Release to confirm (max 20 km²)</li>
         </ol>
         <div className="mt-2 p-2 bg-blue-50 rounded text-xs text-blue-800">
           💡 Without modifier key: pan/zoom map normally

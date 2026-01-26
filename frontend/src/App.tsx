@@ -68,7 +68,7 @@ export default function App() {
           {/* Preview */}
           <div className="flex-1 p-4">
             <Preview3D
-              stlUrl={result?.preview_url}
+              meshData={result?.mesh_data}
               stats={result?.stats}
             />
           </div>
@@ -182,9 +182,9 @@ export default function App() {
             </button>
 
             {/* Download button */}
-            {result && (
+            {result && result.mesh_data && (
               <button
-                onClick={() => api.downloadSTL(result.stl_url)}
+                onClick={() => api.downloadSTL(result.mesh_data, `terrain_${Date.now()}.stl`)}
                 className="w-full py-3 px-6 rounded-lg font-semibold text-white bg-green-600 hover:bg-green-700 transition-colors"
               >
                 Download STL File

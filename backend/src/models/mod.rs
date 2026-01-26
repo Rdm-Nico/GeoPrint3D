@@ -31,8 +31,8 @@ impl BoundingBox {
         let lon_km = (self.max_lon - self.min_lon) * 111.0 * self.min_lat.to_radians().cos();
         let area_km2 = lat_km * lon_km;
 
-        if area_km2 > 1.0 {
-            return Err(format!("Area {:.2} km² exceeds maximum of 1 km²", area_km2));
+        if area_km2 > 20.0 {
+            return Err(format!("Area {:.2} km² exceeds maximum of 20 km²", area_km2));
         }
 
         Ok(area_km2)
@@ -50,9 +50,14 @@ pub struct GenerateRequest {
 
 #[derive(Debug, Serialize)]
 pub struct GenerateResponse {
-    pub preview_url: String,  // URL to low-poly GLB preview
-    pub stl_url: String,      // URL to full-resolution STL
     pub stats: MeshStats,
+    pub mesh_data: MeshData,  // The actual 3D mesh data for rendering
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeshData {
+    pub vertices: Vec<[f32; 3]>,    // [x, y, z] positions
+    pub triangles: Vec<[usize; 3]>, // Triangle indices into vertices
 }
 
 #[derive(Debug, Serialize)]

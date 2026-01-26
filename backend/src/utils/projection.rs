@@ -14,8 +14,13 @@ impl CoordinateProjector {
     /// Create a new projector for the given bounding box
     /// Automatically determines the appropriate UTM zone
     pub fn new(bbox: &BoundingBox) -> Result<Self> {
+        tracing::info!("   ┌─ Coordinate Projector Setup");
+        tracing::info!("   │  Converting: WGS84 (lat/lon degrees) → UTM (meters)");
+
         let center_lon = (bbox.min_lon + bbox.max_lon) / 2.0;
         let center_lat = (bbox.min_lat + bbox.max_lat) / 2.0;
+
+        tracing::info!("   │  Bbox center: ({:.6}°, {:.6}°)", center_lat, center_lon);
 
         // Determine UTM zone from longitude
         let zone = ((center_lon + 180.0) / 6.0).floor() as i32 + 1;
@@ -23,27 +28,27 @@ impl CoordinateProjector {
         // Determine hemisphere
         let hemisphere = if center_lat >= 0.0 { "north" } else { "south" };
 
+        tracing::info!("   │  UTM Zone: {} {}", zone, hemisphere.to_uppercase());
+
         // Create PROJ string for WGS84 -> UTM transformation
         let proj_string = format!(
             "+proj=utm +zone={} +{} +datum=WGS84 +units=m +no_defs",
             zone, hemisphere
         );
 
+        tracing::debug!("   │  PROJ string: {}", proj_string);
+
         let proj = Proj::new_known_crs("EPSG:4326", &proj_string, None)
-            .context("Failed to create coordinate projection")?;
+            .context("Failed to create coordinate projection - PROJ library error")?;
 
         // Project the bbox center to use as origin
         let (origin_x, origin_y) = proj
             .convert((center_lon, center_lat))
-            .context("Failed to project origin")?;
+            .context("Failed to project origin coordinates")?;
 
-        tracing::info!(
-            "Created UTM projection: zone={}, hemisphere={}, origin=({:.2}, {:.2})",
-            zone,
-            hemisphere,
-            origin_x,
-            origin_y
-        );
+        tracing::info!("   │  Local origin (UTM): ({:.2}m, {:.2}m)", origin_x, origin_y);
+        tracing::info!("   │  All coordinates will be relative to this origin");
+        tracing::info!("   └─ Projection ready");
 
         Ok(Self {
             proj,

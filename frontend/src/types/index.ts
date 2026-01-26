@@ -22,10 +22,14 @@ export interface MeshStats {
   buildings_count: number;
 }
 
+export interface MeshData {
+  vertices: [number, number, number][];  // [x, y, z] positions
+  triangles: [number, number, number][]; // Triangle indices into vertices
+}
+
 export interface GenerateResponse {
-  preview_url: string;
-  stl_url: string;
   stats: MeshStats;
+  mesh_data: MeshData;  // The actual 3D mesh data for rendering
 }
 
 export interface MapBounds {

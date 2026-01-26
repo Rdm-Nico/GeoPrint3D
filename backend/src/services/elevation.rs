@@ -32,12 +32,21 @@ impl ElevationService {
         bbox: &BoundingBox,
         resolution: u32,
     ) -> Result<Vec<ElevationPoint>> {
-        tracing::debug!("Generating elevation grid with resolution {}x{}", resolution, resolution);
+        let api_url = "https://api.open-elevation.com/api/v1/lookup";
+
+        tracing::info!("   ┌─ Elevation Service");
+        tracing::info!("   │  API: Open-Elevation (free, public)");
+        tracing::info!("   │  URL: {}", api_url);
+        tracing::info!("   │  Grid: {}x{} = {} total points", resolution + 1, resolution + 1, (resolution + 1) * (resolution + 1));
+
         let mut points = Vec::new();
 
         // Generate grid of lat/lon points
         let lat_step = (bbox.max_lat - bbox.min_lat) / resolution as f64;
         let lon_step = (bbox.max_lon - bbox.min_lon) / resolution as f64;
+
+        tracing::debug!("   │  Lat step: {:.6}° ({:.2}m approx)", lat_step, lat_step * 111_000.0);
+        tracing::debug!("   │  Lon step: {:.6}° ({:.2}m approx)", lon_step, lon_step * 111_000.0 * (bbox.min_lat.to_radians().cos()));
 
         let mut locations = Vec::new();
         for i in 0..=resolution {
@@ -51,24 +60,42 @@ impl ElevationService {
             }
         }
 
-        tracing::debug!("Requesting elevation data for {} points from Open-Elevation API", locations.len());
+        tracing::info!("   │  Sending POST request with {} location points...", locations.len());
+        let request_start = std::time::Instant::now();
 
         // Batch request to Open-Elevation API
-        // Note: For production, consider using Mapbox Terrain-RGB tiles for better performance
         let response = self
             .client
-            .post("https://api.open-elevation.com/api/v1/lookup")
+            .post(api_url)
             .json(&serde_json::json!({ "locations": locations }))
+            .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
-            .context("Failed to fetch elevation data")?;
+            .context("Failed to connect to Open-Elevation API - check network connectivity")?;
 
+        let status = response.status();
+        let request_time = request_start.elapsed();
+
+        tracing::info!("   │  Response status: {} (took {:.2}s)", status, request_time.as_secs_f64());
+
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
+            tracing::error!("   │  API Error Response: {}", error_body);
+            anyhow::bail!("Open-Elevation API returned error status {}: {}", status, error_body);
+        }
+
+        let parse_start = std::time::Instant::now();
         let data: OpenTopoResponse = response
             .json()
             .await
-            .context("Failed to parse elevation response")?;
+            .context("Failed to parse elevation JSON response - API may have returned unexpected format")?;
 
-        tracing::debug!("Received {} elevation points from API", data.results.len());
+        tracing::debug!("   │  JSON parsing took {:.2}ms", parse_start.elapsed().as_secs_f64() * 1000.0);
+
+        if data.results.is_empty() {
+            tracing::warn!("   │  ⚠ API returned empty results array");
+            anyhow::bail!("Open-Elevation API returned no elevation data");
+        }
 
         for result in data.results {
             points.push(ElevationPoint {
@@ -78,7 +105,16 @@ impl ElevationService {
             });
         }
 
-        tracing::info!("Successfully fetched {} elevation points", points.len());
+        // Calculate some statistics
+        let elevations: Vec<f32> = points.iter().map(|p| p.elevation).collect();
+        let min_elev = elevations.iter().cloned().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
+        let max_elev = elevations.iter().cloned().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
+        let avg_elev: f32 = elevations.iter().sum::<f32>() / elevations.len() as f32;
+
+        tracing::info!("   │  ✓ Successfully received {} elevation points", points.len());
+        tracing::info!("   │  Elevation stats: min={:.1}m, max={:.1}m, avg={:.1}m", min_elev, max_elev, avg_elev);
+        tracing::info!("   └─ Total API call time: {:.2}s", request_time.as_secs_f64());
+
         Ok(points)
     }
 
