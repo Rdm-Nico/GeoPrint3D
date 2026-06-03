@@ -12,7 +12,7 @@ export default function App() {
 
   // Advanced settings
   const [resolution, setResolution] = useState(100);
-  const [verticalScale, setVerticalScale] = useState(1.5);
+  const [verticalScale, setVerticalScale] = useState(2.0);
   const [baseHeight, setBaseHeight] = useState(2.0);
   const [includeBuildings, setIncludeBuildings] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
@@ -63,10 +63,10 @@ export default function App() {
           <MapSelector onBoundsChange={setSelectedBounds} />
         </div>
 
-        {/* Preview & Controls panel */}
-        <div className="w-full md:w-1/2 h-[50vh] md:h-full flex flex-col bg-gray-50">
-          {/* Preview */}
-          <div className="flex-1 p-4">
+        {/* Preview & Controls panel — scrollable so controls are always reachable */}
+        <div className="w-full md:w-1/2 h-[50vh] md:h-full flex flex-col bg-gray-50 overflow-y-auto">
+          {/* Preview — fixed height so it doesn't collapse when controls expand */}
+          <div className="flex-shrink-0 h-[25vh] md:h-[42vh] p-4">
             <Preview3D
               meshData={result?.mesh_data}
               stats={result?.stats}
@@ -74,7 +74,7 @@ export default function App() {
           </div>
 
           {/* Control panel */}
-          <div className="p-4 bg-white border-t space-y-4">
+          <div className="flex-shrink-0 p-4 bg-white border-t space-y-4">
             {/* Settings toggle */}
             <button
               onClick={() => setShowSettings(!showSettings)}
@@ -103,13 +103,13 @@ export default function App() {
 
                 <div>
                   <label className="block text-xs font-medium text-gray-700 mb-1">
-                    Vertical Scale: {verticalScale}x
+                    Vertical Exaggeration: {verticalScale}x (1x = ~15% height)
                   </label>
                   <input
                     type="range"
                     min="0.5"
-                    max="3"
-                    step="0.1"
+                    max="10"
+                    step="0.5"
                     value={verticalScale}
                     onChange={(e) => setVerticalScale(Number(e.target.value))}
                     className="w-full"

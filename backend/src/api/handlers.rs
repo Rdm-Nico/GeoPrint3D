@@ -85,7 +85,10 @@ pub async fn generate_terrain(
     tracing::info!("⚙️  STEP 2/8: Applying default parameters");
 
     let resolution = request.resolution.unwrap_or(100);
-    let vertical_scale = request.vertical_scale.unwrap_or(1.5);
+    // vertical_scale is the user's exaggeration preference.
+    // 1.0 = terrain relief fills ~15% of the print height (see adaptive scale below).
+    // 2.0 = ~30%, good default for most areas.
+    let vertical_scale = request.vertical_scale.unwrap_or(2.0);
     let base_height = request.base_height.unwrap_or(2.0);
     let include_buildings = request.include_buildings.unwrap_or(true);
 
@@ -189,6 +192,44 @@ pub async fn generate_terrain(
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 
     // ═══════════════════════════════════════════════════════════════
+    // Compute adaptive terrain scale
+    // ═══════════════════════════════════════════════════════════════
+    // Goal: terrain relief should always be visible in the final print, regardless
+    // of whether the area is the Himalayas or a river delta.
+    //
+    // Formula (derived from the normalization step that maps XY to 100mm):
+    //   terrain_relief_mm = elevation_range_m × terrain_scale × (100mm / xy_range_m)
+    // Setting terrain_relief_mm = 15mm × vertical_scale gives:
+    //   terrain_scale = 0.15 × xy_range_m / elevation_range_m × vertical_scale
+    //
+    // terrain_scale is capped at 50 to prevent pathological exaggeration on
+    // perfectly flat terrain where the API might return elevation_range < 1 m.
+    //
+    // building_scale stays equal to the user's vertical_scale, so buildings are
+    // not blown out of proportion when terrain exaggeration is very high.
+    let xy_range_m = {
+        let x_vals: Vec<f64> = projected_points.iter().map(|p| p.x).collect();
+        let y_vals: Vec<f64> = projected_points.iter().map(|p| p.y).collect();
+        let x_range = x_vals.iter().cloned().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0)
+            - x_vals.iter().cloned().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
+        let y_range = y_vals.iter().cloned().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0)
+            - y_vals.iter().cloned().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
+        (x_range.max(y_range) as f32).max(1.0)
+    };
+    let elevation_range = (elev_max - elev_min).max(1.0_f32);
+    let adaptive_base = (0.15_f32 * xy_range_m / elevation_range).min(50.0_f32);
+    let effective_terrain_scale = adaptive_base * vertical_scale;
+    let effective_building_scale = vertical_scale;
+
+    tracing::info!("─────────────────────────────────────────────────────────────────");
+    tracing::info!("📐 Adaptive scale computation:");
+    tracing::info!("   ├─ XY extent:         {:.1} m", xy_range_m);
+    tracing::info!("   ├─ Elevation range:   {:.1} m", elevation_range);
+    tracing::info!("   ├─ Adaptive base:     {:.2}x", adaptive_base);
+    tracing::info!("   ├─ Terrain scale:     {:.2}x  (adaptive × user {:.1}x)", effective_terrain_scale, vertical_scale);
+    tracing::info!("   └─ Building scale:    {:.2}x  (user {:.1}x, no adaptive)", effective_building_scale, vertical_scale);
+
+    // ═══════════════════════════════════════════════════════════════
     // STEP 6: Generate 3D terrain mesh using Delaunay triangulation
     // ═══════════════════════════════════════════════════════════════
     tracing::info!("─────────────────────────────────────────────────────────────────");
@@ -196,13 +237,16 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Using Delaunay triangulation to create triangle mesh from elevation points");
     let step_start = std::time::Instant::now();
 
-    let mesh_generator = MeshGenerator::new(projector, vertical_scale, base_height);
+    let mesh_generator = MeshGenerator::new(projector, effective_terrain_scale, effective_building_scale, base_height);
     let mut mesh = mesh_generator.generate_terrain_mesh(&projected_points)
         .map_err(|e| {
             tracing::error!("   ✗ FAILED to generate terrain mesh: {}", e);
             ApiError::InternalError(format!("Mesh generation failed: {}", e))
         })?;
 
+    // Record how many vertices belong to terrain (before buildings are added).
+    // This lets add_buildings sample terrain elevation beneath each footprint.
+    let terrain_vertex_count = mesh.vertices.len();
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 
     // ═══════════════════════════════════════════════════════════════
@@ -212,12 +256,12 @@ pub async fn generate_terrain(
     let step_start = std::time::Instant::now();
     if !buildings.is_empty() {
         tracing::info!("🏗️  STEP 7/8: Adding {} building extrusions to mesh", buildings.len());
-        tracing::info!("   └─ Each building footprint is extruded to its height");
+        tracing::info!("   └─ Buildings placed on terrain surface (not at sea level)");
 
         let vertices_before = mesh.vertices.len();
         let triangles_before = mesh.triangles.len();
 
-        mesh_generator.add_buildings(&mut mesh, &buildings)
+        mesh_generator.add_buildings(&mut mesh, &buildings, terrain_vertex_count)
             .map_err(|e| {
                 tracing::error!("   ✗ FAILED to add buildings: {}", e);
                 ApiError::InternalError(format!("Building extrusion failed: {}", e))
@@ -230,6 +274,20 @@ pub async fn generate_terrain(
     } else {
         tracing::info!("🏗️  STEP 7/8: Skipping building extrusions (no buildings)");
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 7b: Normalize mesh to print dimensions (100mm × 100mm)
+    // ═══════════════════════════════════════════════════════════════
+    // Must happen BEFORE close_mesh_with_base so that base_height (in mm)
+    // is correctly applied after all coordinates are in mm units.
+    tracing::info!("─────────────────────────────────────────────────────────────────");
+    tracing::info!("📏 STEP 7b: Normalizing mesh to 100mm print dimensions");
+    tracing::info!("   └─ Converts scaled-meter coordinates to mm for 3D printing");
+    let step_start = std::time::Instant::now();
+
+    mesh_generator.normalize_to_print_size(&mut mesh, 100.0);
+
+    tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 8: Close mesh with base pedestal (CRITICAL for 3D printing)
