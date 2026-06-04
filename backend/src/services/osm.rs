@@ -141,7 +141,9 @@ impl OsmService {
         if buildings.is_empty() {
             tracing::info!("   │  ⚠ No valid buildings found in this area");
         } else {
+            // extract heights
             let heights: Vec<f32> = buildings.iter().map(|b| b.height).collect();
+            // find min and max heights of the buildings by confront each elements in a secure way 
             let min_h = heights.iter().cloned().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
             let max_h = heights.iter().cloned().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
             let avg_h: f32 = heights.iter().sum::<f32>() / heights.len() as f32;
