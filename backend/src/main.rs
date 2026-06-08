@@ -3,7 +3,7 @@ mod models;
 mod services;
 mod utils;
 
-use api::{generate_terrain, health_check, AppState};
+use api::{generate_terrain, health_check, receive_frontend_logs, AppState};
 use axum::{
     routing::{get, post},
     Router,
@@ -11,23 +11,20 @@ use axum::{
 use services::{ElevationService, OsmService};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use utils::{init_logging, FrontendLogWriter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "geoprint3d_backend=debug,tower_http=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Initialise file + console logging with weekly rotation.
+    // The guard must stay alive for the duration of the process.
+    let _log_guard = init_logging("logs")?;
 
     // Initialize services
+    let frontend_log_writer = Arc::new(FrontendLogWriter::new("../frontend/logs")?);
     let state = Arc::new(AppState {
         elevation_service: ElevationService::new(),
         osm_service: OsmService::new(),
+        frontend_log_writer,
     });
 
     // Configure CORS
@@ -40,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/health", get(health_check))
         .route("/api/generate", post(generate_terrain))
+        .route("/api/logs/frontend", post(receive_frontend_logs))
         // TODO: Add download endpoint for serving generated STL files
         // .route("/api/download/:filename", get(download_file))
         .with_state(state)

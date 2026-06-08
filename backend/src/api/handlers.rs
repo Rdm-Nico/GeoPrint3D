@@ -1,6 +1,7 @@
 use crate::models::{GenerateRequest, GenerateResponse, MeshData, MeshStats};
 use crate::services::{ElevationService, OsmService};
-use crate::utils::{CoordinateProjector, MeshExporter, MeshGenerator};
+use crate::services::osm::MAX_AREA_FOR_BUILDINGS_KM2;
+use crate::utils::{CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshGenerator};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -12,6 +13,16 @@ use std::sync::Arc;
 pub struct AppState {
     pub elevation_service: ElevationService,
     pub osm_service: OsmService,
+    pub frontend_log_writer: Arc<FrontendLogWriter>,
+}
+
+/// Receives a batch of frontend log entries and appends them to `frontend/logs/frontend.log`.
+pub async fn receive_frontend_logs(
+    State(state): State<Arc<AppState>>,
+    Json(batch): Json<FrontendLogBatch>,
+) -> StatusCode {
+    state.frontend_log_writer.write_batch(&batch);
+    StatusCode::NO_CONTENT
 }
 
 /// Error type for API responses
@@ -75,7 +86,7 @@ pub async fn generate_terrain(
         .validate_area()
         .map_err(|e| ApiError::BadRequest(e))?;
 
-    tracing::info!("   ✓ Area validated: {:.4} km² (limit: 1.0 km²)", area_km2);
+    tracing::info!("   ✓ Area validated: {:.4} km² (limit: 20.0 km²)", area_km2);
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 
     // ═══════════════════════════════════════════════════════════════
@@ -138,7 +149,20 @@ pub async fn generate_terrain(
     // ═══════════════════════════════════════════════════════════════
     tracing::info!("─────────────────────────────────────────────────────────────────");
     let step_start = std::time::Instant::now();
-    let buildings = if include_buildings {
+    let buildings = if !include_buildings {
+        tracing::info!("🏢 STEP 4/8: Skipping building data (disabled by user)");
+        Vec::new()
+    } else if area_km2 > MAX_AREA_FOR_BUILDINGS_KM2 {
+        tracing::info!(
+            "🏢 STEP 4/8: Skipping buildings — area {:.2} km² > {:.0} km² threshold",
+            area_km2, MAX_AREA_FOR_BUILDINGS_KM2
+        );
+        tracing::info!(
+            "   └─ At this scale buildings would be <{}mm on a 100mm print (below printer resolution)",
+            (10.0 / (area_km2 * 1e6_f64).sqrt() * 100.0) as u32
+        );
+        Vec::new()
+    } else {
         tracing::info!("🏢 STEP 4/8: Fetching building data from OpenStreetMap (Overpass API)");
         tracing::info!("   └─ This step makes an HTTP request to Overpass API...");
 
@@ -157,15 +181,9 @@ pub async fn generate_terrain(
             }
             Err(e) => {
                 tracing::warn!("   ⚠ Failed to fetch buildings (continuing without): {}", e);
-                tracing::warn!("   └─ Possible causes:");
-                tracing::warn!("      • Overpass API is overloaded or down");
-                tracing::warn!("      • Request timeout");
                 Vec::new()
             }
         }
-    } else {
-        tracing::info!("🏢 STEP 4/8: Skipping building data (disabled by user)");
-        Vec::new()
     };
 
     // ═══════════════════════════════════════════════════════════════
