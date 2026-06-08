@@ -4,6 +4,21 @@ import Preview3D from './components/Preview3D';
 import { api } from './services/api';
 import type { BoundingBox, GenerateResponse } from './types';
 
+function computeArea(bbox: BoundingBox): number {
+  const latKm = (bbox.max_lat - bbox.min_lat) * 111.0;
+  const lonKm =
+    (bbox.max_lon - bbox.min_lon) * 111.0 * Math.cos((bbox.min_lat * Math.PI) / 180);
+  return Math.abs(latKm * lonKm);
+}
+
+type AreaStatus = 'green' | 'yellow' | 'red';
+
+function areaStatus(km2: number): AreaStatus {
+  if (km2 > 20) return 'red';
+  if (km2 > 10) return 'yellow';
+  return 'green';
+}
+
 export default function App() {
   const [selectedBounds, setSelectedBounds] = useState<BoundingBox | null>(null);
   const [generating, setGenerating] = useState(false);
@@ -145,12 +160,33 @@ export default function App() {
               </div>
             )}
 
-            {/* Status message */}
-            {selectedBounds && (
-              <div className="text-xs text-green-600 bg-green-50 p-2 rounded">
-                ✓ Area selected ({(result?.stats.area_km2 || 0).toFixed(4)} km²)
-              </div>
-            )}
+            {/* Area semaphore */}
+            {selectedBounds && (() => {
+              const km2 = computeArea(selectedBounds);
+              const status = areaStatus(km2);
+              const styles = {
+                green:  { wrap: 'text-green-700 bg-green-50 border border-green-200',  icon: '🟢' },
+                yellow: { wrap: 'text-yellow-700 bg-yellow-50 border border-yellow-200', icon: '🟡' },
+                red:    { wrap: 'text-red-700 bg-red-50 border border-red-200',         icon: '🔴' },
+              }[status];
+              return (
+                <div className={`text-xs p-2 rounded ${styles.wrap}`}>
+                  <div className="flex items-center gap-1 font-medium">
+                    {styles.icon} Area selected: {km2.toFixed(4)} km²
+                  </div>
+                  {status === 'yellow' && (
+                    <div className="mt-0.5 opacity-80">
+                      Near the 20 km² limit — generation may be slow.
+                    </div>
+                  )}
+                  {status === 'red' && (
+                    <div className="mt-0.5 font-semibold">
+                      Exceeds the 20 km² limit. Please select a smaller area before generating.
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {error && (
               <div className="text-xs text-red-600 bg-red-50 p-2 rounded">
@@ -159,15 +195,20 @@ export default function App() {
             )}
 
             {/* Generate button */}
-            <button
-              onClick={handleGenerate}
-              disabled={!selectedBounds || generating}
-              className={`w-full py-3 px-6 rounded-lg font-semibold text-white transition-colors ${
-                !selectedBounds || generating
-                  ? 'bg-gray-400 cursor-not-allowed'
-                  : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800'
-              }`}
-            >
+            {(() => {
+              const overLimit = selectedBounds ? areaStatus(computeArea(selectedBounds)) === 'red' : false;
+              const disabled = !selectedBounds || generating || overLimit;
+              return (
+              <button
+                onClick={handleGenerate}
+                disabled={disabled}
+                title={overLimit ? 'Area exceeds 20 km² — reduce selection to generate' : undefined}
+                className={`w-full py-3 px-6 rounded-lg font-semibold text-white transition-colors ${
+                  disabled
+                    ? 'bg-gray-400 cursor-not-allowed'
+                    : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800'
+                }`}
+              >
               {generating ? (
                 <span className="flex items-center justify-center">
                   <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -180,6 +221,8 @@ export default function App() {
                 'Generate 3D Model'
               )}
             </button>
+              );
+            })()}
 
             {/* Download button */}
             {result && result.mesh_data && (

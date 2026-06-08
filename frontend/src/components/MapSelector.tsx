@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { MapContainer, TileLayer, Rectangle, useMapEvents } from 'react-leaflet';
+import { useEffect, useRef, useState } from 'react';
+import { MapContainer, TileLayer, Rectangle, useMap, useMapEvents } from 'react-leaflet';
 import L, { type LatLngBounds } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { BoundingBox } from '../types';
@@ -8,7 +8,141 @@ interface MapSelectorProps {
   onBoundsChange: (bbox: BoundingBox | null) => void;
 }
 
-function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: BoundingBox | null) => void }) {
+// ── Nominatim types ────────────────────────────────────────────────────────────
+interface NominatimResult {
+  lat: string;
+  lon: string;
+  display_name: string;
+  boundingbox: [string, string, string, string]; // [south, north, west, east]
+}
+
+// ── Search bar ─────────────────────────────────────────────────────────────────
+// Live search: fires a Nominatim request 350 ms after the user stops typing.
+// Shows the top 3 results in a dropdown; clicking one flies the map there.
+function SearchControl() {
+  const map = useMap();
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<NominatimResult[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // Debounced live search — fires 350 ms after typing stops
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setResults([]);
+      setOpen(false);
+      return;
+    }
+
+    setLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=3`,
+          { headers: { 'Accept-Language': 'en' } }
+        );
+        const data: NominatimResult[] = await res.json();
+        setResults(data);
+        setOpen(data.length > 0);
+      } catch {
+        // silently ignore network errors
+      } finally {
+        setLoading(false);
+      }
+    }, 350);
+
+    return () => {
+      clearTimeout(timer);
+      setLoading(false);
+    };
+  }, [query]);
+
+  function select(r: NominatimResult) {
+    const [south, north, west, east] = r.boundingbox.map(Number);
+    map.fitBounds([[south, west], [north, east]], { maxZoom: 16 });
+    setQuery(r.display_name.split(',')[0]);
+    setOpen(false);
+  }
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  // Prevent Leaflet from swallowing keyboard/mouse/scroll events on the widget
+  useEffect(() => {
+    if (!wrapperRef.current) return;
+    L.DomEvent.disableClickPropagation(wrapperRef.current);
+    L.DomEvent.disableScrollPropagation(wrapperRef.current);
+  }, []);
+
+  return (
+    <div
+      ref={wrapperRef}
+      className="absolute top-4 right-4 z-[1000] w-72"
+      onMouseDown={e => e.stopPropagation()}
+    >
+      {/* Input */}
+      <div className="flex items-center bg-white border border-gray-300 rounded-lg shadow-lg px-3 py-2 gap-2">
+        <span className="text-gray-400 text-sm select-none">🔍</span>
+        <input
+          type="text"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Escape') { setOpen(false); setQuery(''); } }}
+          placeholder="Search places…"
+          className="flex-1 text-sm bg-transparent focus:outline-none text-gray-800 placeholder-gray-400"
+        />
+        {loading && (
+          <span className="text-gray-400 text-xs animate-pulse select-none">…</span>
+        )}
+        {query && !loading && (
+          <button
+            onClick={() => { setQuery(''); setResults([]); setOpen(false); }}
+            className="text-gray-400 hover:text-gray-600 text-sm leading-none"
+            title="Clear"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
+      {/* Dropdown results */}
+      {open && (
+        <ul className="mt-1 bg-white border border-gray-200 rounded-lg shadow-xl text-sm overflow-hidden">
+          {results.map((r, i) => (
+            <li key={i} className="border-b border-gray-100 last:border-0">
+              <button
+                onClick={() => select(r)}
+                className="w-full text-left px-3 py-2.5 hover:bg-blue-50 text-gray-800 flex flex-col gap-0.5"
+              >
+                <span className="font-medium truncate">{r.display_name.split(',')[0]}</span>
+                <span className="text-xs text-gray-400 truncate">
+                  {r.display_name.split(',').slice(1).join(',').trim()}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Bounding-box draw interaction ──────────────────────────────────────────────
+function BoundingBoxSelector({
+  onBoundsChange,
+}: {
+  onBoundsChange: (bbox: BoundingBox | null) => void;
+}) {
   const [bounds, setBounds] = useState<LatLngBounds | null>(null);
   const [startPoint, setStartPoint] = useState<{ lat: number; lng: number } | null>(null);
   const [isSelecting, setIsSelecting] = useState(false);
@@ -16,11 +150,10 @@ function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: Boundi
 
   const map = useMapEvents({
     mousedown: (e) => {
-      // Only start selection if Command (Mac) or Ctrl (Windows/Linux) is pressed
       const originalEvent = e.originalEvent as MouseEvent;
       if (originalEvent.metaKey || originalEvent.ctrlKey) {
         e.originalEvent.preventDefault();
-        map.dragging.disable(); // Disable map dragging during selection
+        map.dragging.disable();
         setIsSelecting(true);
         setStartPoint({ lat: e.latlng.lat, lng: e.latlng.lng });
         setBounds(null);
@@ -29,113 +162,81 @@ function BoundingBoxSelector({ onBoundsChange }: { onBoundsChange: (bbox: Boundi
     },
     mousemove: (e) => {
       if (isSelecting && startPoint) {
-        const newBounds = [
+        const boundsObj = L.latLngBounds(
           [startPoint.lat, startPoint.lng],
-          [e.latlng.lat, e.latlng.lng],
-        ] as [[number, number], [number, number]];
-
-        const boundsObj = L.latLngBounds(newBounds);
+          [e.latlng.lat, e.latlng.lng]
+        );
         setBounds(boundsObj);
       }
     },
     mouseup: (e) => {
       if (isSelecting && startPoint) {
-        const finalBounds = L.latLngBounds([
+        const finalBounds = L.latLngBounds(
           [startPoint.lat, startPoint.lng],
-          [e.latlng.lat, e.latlng.lng],
-        ]);
+          [e.latlng.lat, e.latlng.lng]
+        );
 
-        // Calculate area
-        const area = calculateArea(finalBounds);
-
-        if (area > 20.0) {
-          alert(`Selected area (${area.toFixed(2)} km²) exceeds 20 km² limit. Please select a smaller area.`);
-          setBounds(null);
-          onBoundsChange(null);
-        } else {
-          setBounds(finalBounds);
-          onBoundsChange({
-            min_lat: finalBounds.getSouth(),
-            max_lat: finalBounds.getNorth(),
-            min_lon: finalBounds.getWest(),
-            max_lon: finalBounds.getEast(),
-          });
-        }
+        setBounds(finalBounds);
+        onBoundsChange({
+          min_lat: finalBounds.getSouth(),
+          max_lat: finalBounds.getNorth(),
+          min_lon: finalBounds.getWest(),
+          max_lon: finalBounds.getEast(),
+        });
 
         setStartPoint(null);
         setIsSelecting(false);
-        map.dragging.enable(); // Re-enable map dragging after selection
+        map.dragging.enable();
       }
     },
   });
 
-  // Listen for modifier key press/release globally
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey) {
-        setModifierPressed(true);
-      }
+    const down = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey) setModifierPressed(true);
     };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
+    const up = (e: KeyboardEvent) => {
       if (!e.metaKey && !e.ctrlKey) {
         setModifierPressed(false);
-        // Re-enable dragging if user releases modifier without completing selection
-        if (!isSelecting) {
-          map.dragging.enable();
-        }
+        if (!isSelecting) map.dragging.enable();
       }
     };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
     };
   }, [map, isSelecting]);
 
-  // Calculate approximate area in km²
-  function calculateArea(bounds: LatLngBounds): number {
-    const lat1 = bounds.getSouth();
-    const lat2 = bounds.getNorth();
-    const lon1 = bounds.getWest();
-    const lon2 = bounds.getEast();
-
-    const latKm = (lat2 - lat1) * 111.0;
-    const lonKm = (lon2 - lon1) * 111.0 * Math.cos((lat1 * Math.PI) / 180);
-
-    return Math.abs(latKm * lonKm);
-  }
-
-  // Apply cursor style to map container based on modifier key
   useEffect(() => {
-    const container = map.getContainer();
-    if (modifierPressed) {
-      container.style.cursor = 'crosshair';
-    } else {
-      container.style.cursor = 'grab';
-    }
+    map.getContainer().style.cursor = modifierPressed ? 'crosshair' : 'grab';
   }, [modifierPressed, map]);
+
+  const area = bounds ? calculateArea(bounds) : 0;
+  const rectColor = area > 20 ? '#ef4444' : area > 10 ? '#f59e0b' : '#3b82f6';
 
   return bounds ? (
     <Rectangle
       bounds={bounds}
-      pathOptions={{
-        color: '#3b82f6',
-        weight: 2,
-        fillColor: '#3b82f6',
-        fillOpacity: 0.2,
-      }}
+      pathOptions={{ color: rectColor, weight: 2, fillColor: rectColor, fillOpacity: 0.2 }}
     />
   ) : null;
 }
 
+function calculateArea(bounds: LatLngBounds): number {
+  const latKm = (bounds.getNorth() - bounds.getSouth()) * 111.0;
+  const lonKm =
+    (bounds.getEast() - bounds.getWest()) *
+    111.0 *
+    Math.cos((bounds.getSouth() * Math.PI) / 180);
+  return Math.abs(latKm * lonKm);
+}
+
+// ── Public export ──────────────────────────────────────────────────────────────
 export default function MapSelector({ onBoundsChange }: MapSelectorProps) {
   const [mapKey, setMapKey] = useState(0);
 
-  // Reset map when needed
   const resetMap = () => {
     setMapKey(prev => prev + 1);
     onBoundsChange(null);
@@ -145,7 +246,7 @@ export default function MapSelector({ onBoundsChange }: MapSelectorProps) {
     <div className="relative w-full h-full">
       <MapContainer
         key={mapKey}
-        center={[40.7128, -74.0060]} // New York City default
+        center={[40.7128, -74.006]}
         zoom={13}
         className="w-full h-full"
         style={{ height: '100%', width: '100%' }}
@@ -155,12 +256,20 @@ export default function MapSelector({ onBoundsChange }: MapSelectorProps) {
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
         <BoundingBoxSelector onBoundsChange={onBoundsChange} />
+        <SearchControl />
       </MapContainer>
 
+      {/* Instructions card */}
       <div className="absolute top-4 left-4 bg-white p-4 rounded-lg shadow-lg z-[1000] max-w-xs">
         <h3 className="font-bold text-sm mb-2">How to Select Area:</h3>
         <ol className="text-xs space-y-1 text-gray-700">
-          <li>1. Hold <kbd className="px-1 py-0.5 bg-gray-200 rounded text-xs font-mono">⌘ Cmd</kbd> (Mac) or <kbd className="px-1 py-0.5 bg-gray-200 rounded text-xs font-mono">Ctrl</kbd> (Windows)</li>
+          <li>
+            1. Hold{' '}
+            <kbd className="px-1 py-0.5 bg-gray-200 rounded text-xs font-mono">⌘ Cmd</kbd>{' '}
+            (Mac) or{' '}
+            <kbd className="px-1 py-0.5 bg-gray-200 rounded text-xs font-mono">Ctrl</kbd>{' '}
+            (Windows)
+          </li>
           <li>2. Click and drag to define bounding box</li>
           <li>3. Release to confirm (max 20 km²)</li>
         </ol>
