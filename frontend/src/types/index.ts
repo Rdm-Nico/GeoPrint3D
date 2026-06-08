@@ -25,6 +25,8 @@ export interface MeshStats {
 export interface MeshData {
   vertices: [number, number, number][];  // [x, y, z] positions
   triangles: [number, number, number][]; // Triangle indices into vertices
+  terrain_triangle_count: number;        // triangles[0..this] are terrain
+  building_triangle_count: number;       // triangles[terrain_tc..terrain_tc+this] are buildings
 }
 
 export interface GenerateResponse {

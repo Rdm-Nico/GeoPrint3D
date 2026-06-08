@@ -56,8 +56,10 @@ pub struct GenerateResponse {
 
 #[derive(Debug, Serialize)]
 pub struct MeshData {
-    pub vertices: Vec<[f32; 3]>,    // [x, y, z] positions
-    pub triangles: Vec<[usize; 3]>, // Triangle indices into vertices
+    pub vertices: Vec<[f32; 3]>,         // [x, y, z] positions
+    pub triangles: Vec<[usize; 3]>,      // Triangle indices into vertices
+    pub terrain_triangle_count: usize,   // triangles[0..this] are terrain surface
+    pub building_triangle_count: usize,  // triangles[terrain_tc..terrain_tc+this] are buildings
 }
 
 #[derive(Debug, Serialize)]

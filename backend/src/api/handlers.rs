@@ -235,17 +235,29 @@ pub async fn generate_terrain(
         (x_range.max(y_range) as f32).max(1.0)
     };
     let elevation_range = (elev_max - elev_min).max(1.0_f32);
-    let adaptive_base = (0.15_f32 * xy_range_m / elevation_range).min(50.0_f32);
+
+    // Terrain: target 8% of print height per unit of vertical_scale, cap at 20× to
+    // prevent pathological exaggeration on near-flat terrain (e.g. Amsterdam canal grid).
+    // Result: terrain_relief_mm ≈ 8 × vertical_scale mm on a 100 mm print.
+    let adaptive_base = (0.08_f32 * xy_range_m / elevation_range).min(20.0_f32);
     let effective_terrain_scale = adaptive_base * vertical_scale;
-    let effective_building_scale = vertical_scale;
+
+    // Buildings: normalised so a typical 15 m building is ≈ 12 mm at vertical_scale=2.
+    // Formula derived from: height_mm = height_m × scale × (100/xy_range_m).
+    // Rearranging for height_mm=6·vs: scale = 6·vs·xy_range/(15·100)
+    // This keeps building heights consistent across all area sizes.
+    const REFERENCE_BUILDING_M: f32 = 15.0;
+    const TARGET_BUILDING_MM_PER_VS: f32 = 6.0;
+    let effective_building_scale = TARGET_BUILDING_MM_PER_VS * vertical_scale * xy_range_m
+        / (REFERENCE_BUILDING_M * 100.0);
 
     tracing::info!("─────────────────────────────────────────────────────────────────");
     tracing::info!("📐 Adaptive scale computation:");
     tracing::info!("   ├─ XY extent:         {:.1} m", xy_range_m);
     tracing::info!("   ├─ Elevation range:   {:.1} m", elevation_range);
     tracing::info!("   ├─ Adaptive base:     {:.2}x", adaptive_base);
-    tracing::info!("   ├─ Terrain scale:     {:.2}x  (adaptive × user {:.1}x)", effective_terrain_scale, vertical_scale);
-    tracing::info!("   └─ Building scale:    {:.2}x  (user {:.1}x, no adaptive)", effective_building_scale, vertical_scale);
+    tracing::info!("   ├─ Terrain scale:     {:.2}x  (→ {:.1}mm relief on 100mm print)", effective_terrain_scale, elevation_range * effective_terrain_scale * 100.0 / xy_range_m);
+    tracing::info!("   └─ Building scale:    {:.2}x  (→ {:.1}mm for {:.0}m ref building)", effective_building_scale, REFERENCE_BUILDING_M * effective_building_scale * 100.0 / xy_range_m, REFERENCE_BUILDING_M);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 6: Generate 3D terrain mesh using Delaunay triangulation
@@ -262,9 +274,11 @@ pub async fn generate_terrain(
             ApiError::InternalError(format!("Mesh generation failed: {}", e))
         })?;
 
-    // Record how many vertices belong to terrain (before buildings are added).
-    // This lets add_buildings sample terrain elevation beneath each footprint.
+    // Record terrain vertex/triangle counts before buildings are added.
+    // terrain_vertex_count lets add_buildings sample the ground elevation beneath each footprint.
+    // terrain_triangle_count is sent to the frontend so it can colour terrain and buildings separately.
     let terrain_vertex_count = mesh.vertices.len();
+    let terrain_triangle_count = mesh.triangles.len();
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 
     // ═══════════════════════════════════════════════════════════════
@@ -292,6 +306,7 @@ pub async fn generate_terrain(
     } else {
         tracing::info!("🏗️  STEP 7/8: Skipping building extrusions (no buildings)");
     }
+    let building_triangle_count = mesh.triangles.len() - terrain_triangle_count;
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 7b: Normalize mesh to print dimensions (100mm × 100mm)
@@ -360,10 +375,14 @@ pub async fn generate_terrain(
         buildings_count: buildings.len(),
     };
 
-    // Prepare mesh data for frontend rendering
+    // Prepare mesh data for frontend rendering.
+    // terrain_triangle_count / building_triangle_count tell the renderer which triangles
+    // to colour as terrain (green) vs buildings (grey), ignoring the base-closure triangles.
     let mesh_data = MeshData {
         vertices: mesh.vertices.clone(),
         triangles: mesh.triangles.clone(),
+        terrain_triangle_count,
+        building_triangle_count,
     };
 
     let total_elapsed = total_start.elapsed();
