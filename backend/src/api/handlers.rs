@@ -159,7 +159,7 @@ pub async fn generate_terrain(
     // ═══════════════════════════════════════════════════════════════
     tracing::info!("─────────────────────────────────────────────────────────────────");
     let step_start = std::time::Instant::now();
-    let buildings = if !include_buildings {
+    let mut buildings = if !include_buildings {
         tracing::info!("🏢 STEP 4/8: Skipping building data (disabled by user)");
         Vec::new()
     } else if area_km2 > MAX_AREA_FOR_BUILDINGS_KM2 {
@@ -196,6 +196,41 @@ pub async fn generate_terrain(
             }
         }
     };
+
+    // Soft-knee compression of outlier-tall buildings.
+    // Building height scaling is linear, so a real 100 m+ landmark (St Peter's,
+    // Asinelli Tower) towers absurdly over a 10 m city. Buildings up to a
+    // scene-aware knee (3× the median height, floored at 20 m) stay untouched —
+    // preserving the proportions that already look right — while only the extreme
+    // outliers above the knee are compressed, so landmarks stay tallest without
+    // blowing out the scale.
+    if buildings.len() >= 8 {
+        const KNEE_MULT: f32 = 3.0;
+        const KNEE_FLOOR_M: f32 = 20.0;
+        const SLOPE: f32 = 0.30;
+
+        let mut sorted: Vec<f32> = buildings.iter().map(|b| b.height).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = sorted[sorted.len() / 2];
+        let knee = (median * KNEE_MULT).max(KNEE_FLOOR_M);
+        let max_before = *sorted.last().unwrap();
+
+        let mut compressed = 0usize;
+        let mut max_after = 0.0f32;
+        for b in &mut buildings {
+            if b.height > knee {
+                b.height = knee + (b.height - knee) * SLOPE;
+                compressed += 1;
+            }
+            max_after = max_after.max(b.height);
+        }
+        if compressed > 0 {
+            tracing::info!(
+                "   └─ Height compression: median {:.0}m, knee {:.0}m → compressed {} building(s); max {:.0}m → {:.0}m",
+                median, knee, compressed, max_before, max_after
+            );
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 5: Project coordinates from WGS84 to UTM (meters)

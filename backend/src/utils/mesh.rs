@@ -14,6 +14,78 @@ fn signed_area(pts: &[(f32, f32)]) -> f32 {
     a * 0.5
 }
 
+/// Coarse uniform-grid spatial index over terrain vertices for fast nearest-Z
+/// lookups. Used to anchor building bases to the ground beneath their footprint
+/// (O(1) amortised per query vs an O(n) scan of every terrain vertex).
+struct TerrainIndex {
+    verts: Vec<[f32; 3]>,
+    inv_cell: f32,
+    min_x: f32,
+    min_y: f32,
+    buckets: std::collections::HashMap<(i32, i32), Vec<u32>>,
+}
+
+impl TerrainIndex {
+    fn build(verts: Vec<[f32; 3]>) -> Self {
+        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+        for v in &verts {
+            min_x = min_x.min(v[0]);
+            max_x = max_x.max(v[0]);
+            min_y = min_y.min(v[1]);
+            max_y = max_y.max(v[1]);
+        }
+        let span = (max_x - min_x).max(max_y - min_y).max(1.0);
+        // ~sqrt(n) cells per axis → roughly one point per cell on a regular grid.
+        let cells = (verts.len().max(1) as f32).sqrt().max(1.0);
+        let cell = (span / cells).max(1e-3);
+        let inv_cell = 1.0 / cell;
+        let mut buckets: std::collections::HashMap<(i32, i32), Vec<u32>> =
+            std::collections::HashMap::new();
+        for (i, v) in verts.iter().enumerate() {
+            let key = (((v[0] - min_x) * inv_cell) as i32, ((v[1] - min_y) * inv_cell) as i32);
+            buckets.entry(key).or_default().push(i as u32);
+        }
+        Self { verts, inv_cell, min_x, min_y, buckets }
+    }
+
+    /// Nearest terrain Z to (x, y), searching outward in grid rings.
+    fn nearest_z(&self, x: f32, y: f32) -> Option<f32> {
+        if self.verts.is_empty() {
+            return None;
+        }
+        let cx = ((x - self.min_x) * self.inv_cell) as i32;
+        let cy = ((y - self.min_y) * self.inv_cell) as i32;
+        let mut best_d = f32::MAX;
+        let mut best_z = None;
+        for r in 0..8 {
+            for gx in (cx - r)..=(cx + r) {
+                for gy in (cy - r)..=(cy + r) {
+                    // Only visit the ring at radius r; interior was searched already.
+                    if r > 0 && gx > cx - r && gx < cx + r && gy > cy - r && gy < cy + r {
+                        continue;
+                    }
+                    if let Some(ids) = self.buckets.get(&(gx, gy)) {
+                        for &id in ids {
+                            let v = self.verts[id as usize];
+                            let d = (v[0] - x).powi(2) + (v[1] - y).powi(2);
+                            if d < best_d {
+                                best_d = d;
+                                best_z = Some(v[2]);
+                            }
+                        }
+                    }
+                }
+            }
+            // One extra ring past the first hit guarantees the true nearest.
+            if best_z.is_some() && r >= 1 {
+                break;
+            }
+        }
+        best_z
+    }
+}
+
 /// Generates a 3D mesh from elevation data and buildings
 pub struct MeshGenerator {
     projector: CoordinateProjector,
@@ -120,9 +192,9 @@ impl MeshGenerator {
         let vertices_before = mesh.vertices.len();
         let triangles_before = mesh.triangles.len();
 
-        // Clone terrain vertices once so we can look up ground elevation while
-        // mutably borrowing the mesh to push building geometry.
-        let terrain_verts: Vec<[f32; 3]> = mesh.vertices[..terrain_vertex_count].to_vec();
+        // Build a spatial index of terrain vertices once so we can look up ground
+        // elevation cheaply while mutably borrowing the mesh to push geometry.
+        let terrain = TerrainIndex::build(mesh.vertices[..terrain_vertex_count].to_vec());
 
         let mut successful = 0;
         let mut skipped = 0;
@@ -132,7 +204,7 @@ impl MeshGenerator {
                 skipped += 1;
                 continue;
             }
-            match self.add_building_to_mesh(mesh, building, &terrain_verts) {
+            match self.add_building_to_mesh(mesh, building, &terrain) {
                 Ok(_) => successful += 1,
                 Err(e) => {
                     tracing::debug!("   │  Skipped building {}: {}", i, e);
@@ -157,7 +229,7 @@ impl MeshGenerator {
         &self,
         mesh: &mut TerrainMesh,
         building: &Building,
-        terrain_verts: &[[f32; 3]],
+        terrain: &TerrainIndex,
     ) -> Result<()> {
         if building.footprint.len() < 3 {
             return Ok(());
@@ -169,10 +241,26 @@ impl MeshGenerator {
             footprint.push((point.x as f32, point.y as f32));
         }
 
-        // OSM closed ways repeat the first node as the last — drop it before triangulating.
-        if footprint.len() >= 2 && footprint.first() == footprint.last() {
-            footprint.pop();
+        // Drop consecutive duplicate / near-duplicate vertices (incl. the repeated
+        // closing node of OSM ways). These create zero-area slivers that make earcut
+        // emit degenerate triangles and produce visible rendering artifacts.
+        const EPS_M: f32 = 0.05;
+        let mut clean: Vec<(f32, f32)> = Vec::with_capacity(footprint.len());
+        for &p in &footprint {
+            if let Some(&last) = clean.last() {
+                if (p.0 - last.0).abs() < EPS_M && (p.1 - last.1).abs() < EPS_M {
+                    continue;
+                }
+            }
+            clean.push(p);
         }
+        if clean.len() >= 2 {
+            let (f, l) = (clean[0], *clean.last().unwrap());
+            if (f.0 - l.0).abs() < EPS_M && (f.1 - l.1).abs() < EPS_M {
+                clean.pop();
+            }
+        }
+        footprint = clean;
         let n = footprint.len();
         if n < 3 {
             return Ok(());
@@ -183,25 +271,19 @@ impl MeshGenerator {
             footprint.reverse();
         }
 
-        // Find the terrain elevation directly beneath this building by searching for
-        // the nearest terrain vertex to the building centroid. This places buildings
-        // on the actual ground rather than always at the river/minimum level.
-        let cx = footprint.iter().map(|(x, _)| *x).sum::<f32>() / n as f32;
-        let cy = footprint.iter().map(|(_, y)| *y).sum::<f32>() / n as f32;
-
-        let base_elevation = if terrain_verts.is_empty() {
-            0.0_f32
-        } else {
-            terrain_verts
-                .iter()
-                .min_by(|a, b| {
-                    let da = (a[0] - cx).powi(2) + (a[1] - cy).powi(2);
-                    let db = (b[0] - cx).powi(2) + (b[1] - cy).powi(2);
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|v| v[2])
-                .unwrap_or(0.0)
-        };
+        // Anchor the base to the LOWEST ground under the footprint. A single flat
+        // base on sloped terrain otherwise leaves large buildings floating (a gap
+        // on the downhill side) or sunk on the uphill side; taking the minimum
+        // embeds the uphill edge instead, so the building always meets the ground.
+        let mut base_elevation = f32::INFINITY;
+        for &(x, y) in &footprint {
+            if let Some(z) = terrain.nearest_z(x, y) {
+                base_elevation = base_elevation.min(z);
+            }
+        }
+        if !base_elevation.is_finite() {
+            base_elevation = 0.0;
+        }
 
         // building_scale is independent of terrain_scale so that building heights
         // stay proportional to reality even when terrain is heavily exaggerated.
