@@ -42,10 +42,11 @@ impl BoundingBox {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GenerateRequest {
     pub bbox: BoundingBox,
-    pub resolution: Option<u32>,  // Grid resolution (default: 100x100)
-    pub vertical_scale: Option<f32>,  // Exaggeration factor (default: 1.5)
+    pub resolution: Option<u32>,  // Grid resolution (default: 150x150)
+    pub vertical_scale: Option<f32>,  // Exaggeration factor (default: 2.0)
     pub base_height: Option<f32>,  // Base pedestal height in mm (default: 2.0)
     pub include_buildings: Option<bool>,  // Include OSM buildings (default: true)
+    pub print_size: Option<f32>,  // Largest XY print dimension in mm (default: 180.0)
 }
 
 #[derive(Debug, Serialize)]

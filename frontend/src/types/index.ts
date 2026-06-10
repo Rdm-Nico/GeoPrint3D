@@ -11,6 +11,7 @@ export interface GenerateRequest {
   vertical_scale?: number;
   base_height?: number;
   include_buildings?: boolean;
+  print_size?: number;  // Largest XY print dimension in mm (default: 180)
 }
 
 export interface MeshStats {

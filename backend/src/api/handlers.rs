@@ -95,18 +95,20 @@ pub async fn generate_terrain(
     tracing::info!("─────────────────────────────────────────────────────────────────");
     tracing::info!("⚙️  STEP 2/8: Applying default parameters");
 
-    let resolution = request.resolution.unwrap_or(100);
-    // vertical_scale is the user's exaggeration preference.
-    // 1.0 = terrain relief fills ~15% of the print height (see adaptive scale below).
-    // 2.0 = ~30%, good default for most areas.
+    let resolution = request.resolution.unwrap_or(150);
+    // vertical_scale is the user's exaggeration preference, neutral at 2.0 (see
+    // the saturating terrain-scale model below).
     let vertical_scale = request.vertical_scale.unwrap_or(2.0);
     let base_height = request.base_height.unwrap_or(2.0);
     let include_buildings = request.include_buildings.unwrap_or(true);
+    // Largest XY dimension of the printed model in mm.
+    let print_size_mm = request.print_size.unwrap_or(180.0);
 
     tracing::info!("   └─ Resolution: {} ({}x{} = {} grid points)",
         resolution, resolution, resolution, resolution * resolution);
     tracing::info!("   └─ Vertical scale: {}x (elevation exaggeration for visibility)", vertical_scale);
     tracing::info!("   └─ Base height: {} mm (solid base for 3D printing)", base_height);
+    tracing::info!("   └─ Print size: {} mm (largest XY dimension)", print_size_mm);
     tracing::info!("   └─ Include buildings: {}", include_buildings);
 
     // ═══════════════════════════════════════════════════════════════
@@ -117,7 +119,7 @@ pub async fn generate_terrain(
     tracing::info!("   └─ This step makes an HTTP request to external API...");
     let step_start = std::time::Instant::now();
 
-    let elevation_points = state
+    let mut elevation_points = state
         .elevation_service
         .fetch_elevation_grid(&request.bbox, resolution)
         .await
@@ -135,6 +137,14 @@ pub async fn generate_terrain(
         return Err(ApiError::InternalError(
             "No elevation data received from API".to_string(),
         ));
+    }
+
+    // Light low-pass over the regular grid to remove DEM quantisation terracing
+    // (integer-metre stair-steps) without flattening genuine relief.
+    let grid_dim = (resolution + 1) as usize;
+    if elevation_points.len() == grid_dim * grid_dim {
+        crate::services::elevation::smooth_elevation_grid(&mut elevation_points, grid_dim, grid_dim, 1);
+        tracing::info!("   └─ Applied light grid smoothing (1 pass, {}×{})", grid_dim, grid_dim);
     }
 
     let elev_min = elevation_points.iter().map(|p| p.elevation).min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
@@ -158,8 +168,9 @@ pub async fn generate_terrain(
             area_km2, MAX_AREA_FOR_BUILDINGS_KM2
         );
         tracing::info!(
-            "   └─ At this scale buildings would be <{}mm on a 100mm print (below printer resolution)",
-            (10.0 / (area_km2 * 1e6_f64).sqrt() * 100.0) as u32
+            "   └─ At this scale buildings would be <{}mm on a {:.0}mm print (below printer resolution)",
+            (10.0 / (area_km2 * 1e6_f64).sqrt() * print_size_mm as f64) as u32,
+            print_size_mm
         );
         Vec::new()
     } else {
@@ -210,21 +221,13 @@ pub async fn generate_terrain(
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 
     // ═══════════════════════════════════════════════════════════════
-    // Compute adaptive terrain scale
+    // Compute scaling (saturating, relief-proportional)
     // ═══════════════════════════════════════════════════════════════
-    // Goal: terrain relief should always be visible in the final print, regardless
-    // of whether the area is the Himalayas or a river delta.
-    //
-    // Formula (derived from the normalization step that maps XY to 100mm):
-    //   terrain_relief_mm = elevation_range_m × terrain_scale × (100mm / xy_range_m)
-    // Setting terrain_relief_mm = 15mm × vertical_scale gives:
-    //   terrain_scale = 0.15 × xy_range_m / elevation_range_m × vertical_scale
-    //
-    // terrain_scale is capped at 50 to prevent pathological exaggeration on
-    // perfectly flat terrain where the API might return elevation_range < 1 m.
-    //
-    // building_scale stays equal to the user's vertical_scale, so buildings are
-    // not blown out of proportion when terrain exaggeration is very high.
+    // Unlike a constant-relief target (which amplifies flat terrain hardest and
+    // turns DEM noise into fake hills), this maps real relief through a saturating
+    // curve: flat terrain stays flat, real relief is visible, big mountains compress.
+    // In urban scenes terrain is further capped so buildings remain the dominant
+    // feature. Terrain and building scales are independent.
     let xy_range_m = {
         let x_vals: Vec<f64> = projected_points.iter().map(|p| p.x).collect();
         let y_vals: Vec<f64> = projected_points.iter().map(|p| p.y).collect();
@@ -236,28 +239,54 @@ pub async fn generate_terrain(
     };
     let elevation_range = (elev_max - elev_min).max(1.0_f32);
 
-    // Terrain: target 8% of print height per unit of vertical_scale, cap at 20× to
-    // prevent pathological exaggeration on near-flat terrain (e.g. Amsterdam canal grid).
-    // Result: terrain_relief_mm ≈ 8 × vertical_scale mm on a 100 mm print.
-    let adaptive_base = (0.08_f32 * xy_range_m / elevation_range).min(20.0_f32);
-    let effective_terrain_scale = adaptive_base * vertical_scale;
+    // mm per real metre after normalization (matches normalize_to_print_size).
+    let mm_per_m = print_size_mm / xy_range_m;
+    let relief_m = elevation_range; // already clamped to ≥ 1.0 above
 
-    // Buildings: normalised so a typical 15 m building is ≈ 12 mm at vertical_scale=2.
-    // Formula derived from: height_mm = height_m × scale × (100/xy_range_m).
-    // Rearranging for height_mm=6·vs: scale = 6·vs·xy_range/(15·100)
-    // This keeps building heights consistent across all area sizes.
+    const MAX_TERRAIN_FRAC: f32 = 0.28; // terrain relief never exceeds this × print size
+    const HALF_RELIEF_M: f32 = 120.0;   // relief at which we reach half of the cap
+    const NOISE_FLOOR_M: f32 = 3.0;     // below this, terrain is treated as flat
+    let max_terrain_mm = MAX_TERRAIN_FRAC * print_size_mm;
+    let has_buildings = !buildings.is_empty();
+
+    // Saturating target relief, then user knob (neutral at 2.0).
+    let mut target_terrain_mm = if relief_m < NOISE_FLOOR_M {
+        1.0 // a thin lip only — keep flat cities flat
+    } else {
+        max_terrain_mm * relief_m / (relief_m + HALF_RELIEF_M)
+    };
+    target_terrain_mm *= vertical_scale / 2.0;
+
+    let scene_mode = if relief_m < NOISE_FLOOR_M {
+        "flat"
+    } else if has_buildings {
+        // Keep terrain from drowning the architecture in cities.
+        target_terrain_mm = target_terrain_mm.min(12.0 * (vertical_scale / 2.0));
+        "urban"
+    } else {
+        "natural"
+    };
+    target_terrain_mm = target_terrain_mm.clamp(0.0, max_terrain_mm);
+
+    let effective_terrain_scale = if relief_m > 0.5 {
+        target_terrain_mm / (relief_m * mm_per_m)
+    } else {
+        0.0
+    };
+
+    // Buildings: a REFERENCE_BUILDING_M building reaches target_building_mm at vs=2,
+    // independent of area size. height_mm = height_m × scale × mm_per_m.
     const REFERENCE_BUILDING_M: f32 = 15.0;
-    const TARGET_BUILDING_MM_PER_VS: f32 = 6.0;
-    let effective_building_scale = TARGET_BUILDING_MM_PER_VS * vertical_scale * xy_range_m
-        / (REFERENCE_BUILDING_M * 100.0);
+    const TARGET_BUILDING_MM_PER_VS: f32 = 6.0; // → 12mm at vs=2 for a 15m building
+    let target_building_mm = TARGET_BUILDING_MM_PER_VS * vertical_scale;
+    let effective_building_scale = target_building_mm / (REFERENCE_BUILDING_M * mm_per_m);
 
     tracing::info!("─────────────────────────────────────────────────────────────────");
-    tracing::info!("📐 Adaptive scale computation:");
-    tracing::info!("   ├─ XY extent:         {:.1} m", xy_range_m);
-    tracing::info!("   ├─ Elevation range:   {:.1} m", elevation_range);
-    tracing::info!("   ├─ Adaptive base:     {:.2}x", adaptive_base);
-    tracing::info!("   ├─ Terrain scale:     {:.2}x  (→ {:.1}mm relief on 100mm print)", effective_terrain_scale, elevation_range * effective_terrain_scale * 100.0 / xy_range_m);
-    tracing::info!("   └─ Building scale:    {:.2}x  (→ {:.1}mm for {:.0}m ref building)", effective_building_scale, REFERENCE_BUILDING_M * effective_building_scale * 100.0 / xy_range_m, REFERENCE_BUILDING_M);
+    tracing::info!("📐 Scaling model ({} scene):", scene_mode);
+    tracing::info!("   ├─ XY extent:        {:.1} m  (→ {:.1}mm print, {:.4} mm/m)", xy_range_m, print_size_mm, mm_per_m);
+    tracing::info!("   ├─ Relief:           {:.1} m", relief_m);
+    tracing::info!("   ├─ Terrain target:   {:.1} mm  (scale {:.2}x)", target_terrain_mm, effective_terrain_scale);
+    tracing::info!("   └─ Building target:  {:.1} mm for {:.0}m ref  (scale {:.2}x)", target_building_mm, REFERENCE_BUILDING_M, effective_building_scale);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 6: Generate 3D terrain mesh using Delaunay triangulation
@@ -314,11 +343,11 @@ pub async fn generate_terrain(
     // Must happen BEFORE close_mesh_with_base so that base_height (in mm)
     // is correctly applied after all coordinates are in mm units.
     tracing::info!("─────────────────────────────────────────────────────────────────");
-    tracing::info!("📏 STEP 7b: Normalizing mesh to 100mm print dimensions");
+    tracing::info!("📏 STEP 7b: Normalizing mesh to {}mm print dimensions", print_size_mm);
     tracing::info!("   └─ Converts scaled-meter coordinates to mm for 3D printing");
     let step_start = std::time::Instant::now();
 
-    mesh_generator.normalize_to_print_size(&mut mesh, 100.0);
+    mesh_generator.normalize_to_print_size(&mut mesh, print_size_mm);
 
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
 

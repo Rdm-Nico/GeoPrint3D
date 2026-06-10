@@ -25,6 +25,10 @@ proj = "0.27"  # Coordinate projection (PROJ library)
 # 3D mesh generation
 nalgebra = "0.32"
 delaunator = "1.0"  # Delaunay triangulation
+earcutr = "0.4"     # Ear-clipping polygon triangulation (concave building footprints)
+
+# Raster decoding (Mapbox Terrain-RGB PNG tiles)
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # STL export
 stl_io = "0.7"
@@ -40,5 +44,8 @@ bytes = "1.5"
 
 # Async
 futures = "0.3"
+
+# Config
+dotenvy = "0.15"  # Loads MAPBOX_TOKEN from backend/.env
 
 [dev-dependencies]

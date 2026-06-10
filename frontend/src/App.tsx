@@ -26,9 +26,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   // Advanced settings
-  const [resolution, setResolution] = useState(100);
+  const [resolution, setResolution] = useState(150);
   const [verticalScale, setVerticalScale] = useState(2.0);
   const [baseHeight, setBaseHeight] = useState(2.0);
+  const [printSize, setPrintSize] = useState(180);
   const [includeBuildings, setIncludeBuildings] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -49,6 +50,7 @@ export default function App() {
         vertical_scale: verticalScale,
         base_height: baseHeight,
         include_buildings: includeBuildings,
+        print_size: printSize,
       });
 
       setResult(response);
@@ -108,7 +110,7 @@ export default function App() {
                   <input
                     type="range"
                     min="50"
-                    max="200"
+                    max="250"
                     step="10"
                     value={resolution}
                     onChange={(e) => setResolution(Number(e.target.value))}
@@ -142,6 +144,21 @@ export default function App() {
                     step="0.5"
                     value={baseHeight}
                     onChange={(e) => setBaseHeight(Number(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">
+                    Print Size: {printSize}mm
+                  </label>
+                  <input
+                    type="range"
+                    min="80"
+                    max="250"
+                    step="10"
+                    value={printSize}
+                    onChange={(e) => setPrintSize(Number(e.target.value))}
                     className="w-full"
                   />
                 </div>

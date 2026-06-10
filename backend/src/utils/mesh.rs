@@ -2,6 +2,18 @@ use crate::models::{Building, ProjectedPoint, TerrainMesh};
 use crate::utils::projection::CoordinateProjector;
 use anyhow::Result;
 
+/// Signed area (shoelace) of a 2D polygon ring; positive ⇒ counter-clockwise.
+fn signed_area(pts: &[(f32, f32)]) -> f32 {
+    let n = pts.len();
+    let mut a = 0.0f32;
+    for i in 0..n {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % n];
+        a += x0 * y1 - x1 * y0;
+    }
+    a * 0.5
+}
+
 /// Generates a 3D mesh from elevation data and buildings
 pub struct MeshGenerator {
     projector: CoordinateProjector,
@@ -151,19 +163,31 @@ impl MeshGenerator {
             return Ok(());
         }
 
-        let mut projected_footprint = Vec::new();
+        let mut footprint: Vec<(f32, f32)> = Vec::with_capacity(building.footprint.len());
         for &(lon, lat) in &building.footprint {
             let point = self.projector.project(lon, lat, 0.0)?;
-            projected_footprint.push((point.x as f32, point.y as f32));
+            footprint.push((point.x as f32, point.y as f32));
         }
 
-        let n = projected_footprint.len();
+        // OSM closed ways repeat the first node as the last — drop it before triangulating.
+        if footprint.len() >= 2 && footprint.first() == footprint.last() {
+            footprint.pop();
+        }
+        let n = footprint.len();
+        if n < 3 {
+            return Ok(());
+        }
+
+        // Normalise winding to counter-clockwise so the top cap normal points +Z.
+        if signed_area(&footprint) < 0.0 {
+            footprint.reverse();
+        }
 
         // Find the terrain elevation directly beneath this building by searching for
         // the nearest terrain vertex to the building centroid. This places buildings
         // on the actual ground rather than always at the river/minimum level.
-        let cx = projected_footprint.iter().map(|(x, _)| *x).sum::<f32>() / n as f32;
-        let cy = projected_footprint.iter().map(|(_, y)| *y).sum::<f32>() / n as f32;
+        let cx = footprint.iter().map(|(x, _)| *x).sum::<f32>() / n as f32;
+        let cy = footprint.iter().map(|(_, y)| *y).sum::<f32>() / n as f32;
 
         let base_elevation = if terrain_verts.is_empty() {
             0.0_f32
@@ -183,34 +207,38 @@ impl MeshGenerator {
         // stay proportional to reality even when terrain is heavily exaggerated.
         let top_elevation = base_elevation + building.height * self.building_scale;
 
-        let base_index = mesh.vertices.len();
+        // Triangulate the (possibly concave) footprint with ear clipping.
+        let flat: Vec<f64> = footprint.iter().flat_map(|&(x, y)| [x as f64, y as f64]).collect();
+        let cap = earcutr::earcut(&flat, &[], 2)
+            .map_err(|e| anyhow::anyhow!("earcut failed: {:?}", e))?;
+        if cap.is_empty() {
+            anyhow::bail!("degenerate footprint (no triangles produced)");
+        }
 
-        for &(x, y) in &projected_footprint {
+        let base_index = mesh.vertices.len();
+        for &(x, y) in &footprint {
             mesh.vertices.push([x, y, base_elevation]);
         }
-        for &(x, y) in &projected_footprint {
+        for &(x, y) in &footprint {
             mesh.vertices.push([x, y, top_elevation]);
         }
+        let top0 = base_index + n;
 
-        // Wall triangles (two per edge, closing the last edge via the repeated first node
-        // that OSM closed ways include)
-        for i in 0..n - 1 {
+        // Walls: one quad (two triangles) per footprint edge, with wrap-around.
+        for i in 0..n {
+            let j = (i + 1) % n;
             let bc = base_index + i;
-            let bn = base_index + i + 1;
-            let tc = base_index + n + i;
-            let tn = base_index + n + i + 1;
+            let bn = base_index + j;
+            let tc = top0 + i;
+            let tn = top0 + j;
             mesh.triangles.push([bc, bn, tc]);
             mesh.triangles.push([tc, bn, tn]);
         }
 
-        // Top face (fan triangulation, CCW from above)
-        for i in 1..n - 2 {
-            mesh.triangles.push([base_index + n, base_index + n + i, base_index + n + i + 1]);
-        }
-
-        // Bottom face (flipped winding for downward-facing normal)
-        for i in 1..n - 2 {
-            mesh.triangles.push([base_index, base_index + i + 1, base_index + i]);
+        // Caps from the ear-clip result: top CCW (+Z), bottom reversed (−Z).
+        for t in cap.chunks_exact(3) {
+            mesh.triangles.push([top0 + t[0], top0 + t[1], top0 + t[2]]);
+            mesh.triangles.push([base_index + t[0], base_index + t[2], base_index + t[1]]);
         }
 
         Ok(())

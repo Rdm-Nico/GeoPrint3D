@@ -152,7 +152,8 @@ impl OsmService {
 
         for el in elements.iter() {
             let tags = &el["tags"];
-            let height = parse_height(tags, &mut tag, &mut levels, &mut default);
+            let id = el["id"].as_u64().unwrap_or(0);
+            let height = building_height(tags, id, &mut tag, &mut levels, &mut default);
 
             let Some(geometry) = el["geometry"].as_array() else {
                 skipped += 1;
@@ -208,7 +209,8 @@ impl OsmService {
                 continue;
             }
 
-            let height = parse_height(tags, &mut tag, &mut levels, &mut default);
+            let id = el["id"].as_u64().unwrap_or(0);
+            let height = building_height(tags, id, &mut tag, &mut levels, &mut default);
 
             let Some(node_refs) = el["nodes"].as_array() else {
                 skipped += 1;
@@ -235,19 +237,74 @@ impl OsmService {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn parse_height(tags: &Value, tag: &mut usize, levels: &mut usize, default: &mut usize) -> f32 {
-    if let Some(h) = tags["height"].as_str() {
+/// Resolve a building height in metres from OSM tags.
+/// Priority: explicit `height`/`est_height` → `building:levels` (+roof) → type-aware default.
+/// Defaulted heights receive a small deterministic jitter (seeded by OSM id) so areas
+/// lacking height data stop rendering as a grid of identical cubes.
+fn building_height(
+    tags: &Value,
+    id: u64,
+    tag: &mut usize,
+    levels: &mut usize,
+    default: &mut usize,
+) -> f32 {
+    // 1. Explicit height in metres (tolerant of "12 m", "12.5", ranges "10-20").
+    if let Some(h) = tags["height"].as_str().and_then(parse_meters) {
         *tag += 1;
-        h.trim_end_matches(|c: char| c == 'm' || c == ' ')
-            .parse::<f32>()
-            .unwrap_or(10.0)
-    } else if let Some(l) = tags["building:levels"].as_str() {
-        *levels += 1;
-        l.parse::<f32>().unwrap_or(3.0) * 3.5
-    } else {
-        *default += 1;
-        10.0
+        return h.max(1.0);
     }
+    if let Some(h) = tags["est_height"].as_str().and_then(parse_meters) {
+        *tag += 1;
+        return h.max(1.0);
+    }
+
+    // 2. Storey count → metres (~3.2 m/floor), adding roof levels when tagged.
+    if let Some(l) = tags["building:levels"].as_str().and_then(|s| s.trim().parse::<f32>().ok()) {
+        *levels += 1;
+        let roof = tags["roof:levels"]
+            .as_str()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(0.0);
+        return ((l + roof) * 3.2).max(2.5);
+    }
+
+    // 3. Type-aware default with deterministic per-building variation.
+    *default += 1;
+    default_height_for_type(tags["building"].as_str().unwrap_or("yes")) * jitter(id)
+}
+
+/// Parse a metric height value, tolerating a trailing unit and "a-b" ranges (→ midpoint).
+fn parse_meters(s: &str) -> Option<f32> {
+    let s = s.trim().trim_end_matches(['m', ' ']).trim();
+    if let Some((a, b)) = s.split_once('-') {
+        if let (Ok(a), Ok(b)) = (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
+            return Some((a + b) / 2.0);
+        }
+    }
+    s.parse::<f32>().ok()
+}
+
+/// Plausible default height (m) by OSM `building=` type, so missing-data areas
+/// keep relative proportions (a house is not as tall as a cathedral).
+fn default_height_for_type(kind: &str) -> f32 {
+    match kind {
+        "house" | "detached" | "bungalow" | "cabin" | "hut" | "static_caravan" => 6.0,
+        "garage" | "garages" | "shed" | "carport" | "roof" | "kiosk" => 3.0,
+        "apartments" | "residential" | "dormitory" | "terrace" => 15.0,
+        "commercial" | "office" | "hotel" => 14.0,
+        "retail" | "supermarket" | "warehouse" => 8.0,
+        "industrial" | "manufacture" | "hangar" => 9.0,
+        "church" | "cathedral" | "mosque" | "temple" | "chapel" | "basilica" => 18.0,
+        "school" | "university" | "college" | "hospital" | "public" | "civic" | "government" => 12.0,
+        "tower" | "skyscraper" => 40.0,
+        _ => 8.0,
+    }
+}
+
+/// Deterministic ±~12% multiplier seeded by OSM id (stable across runs).
+fn jitter(id: u64) -> f32 {
+    let h = (id.wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0; // [0,1)
+    0.88 + 0.24 * h
 }
 
 fn log_building_stats(

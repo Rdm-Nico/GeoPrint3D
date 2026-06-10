@@ -15,14 +15,20 @@ use utils::{init_logging, FrontendLogWriter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load backend/.env (if present) so MAPBOX_TOKEN can be set there.
+    dotenvy::dotenv().ok();
+
     // Initialise file + console logging with weekly rotation.
     // The guard must stay alive for the duration of the process.
     let _log_guard = init_logging("logs")?;
 
-    // Initialize services
+    // Initialize services.
+    // MAPBOX_TOKEN (optional) enables high-resolution Terrain-RGB elevation;
+    // without it the service falls back to the free Open-Elevation API.
+    let mapbox_token = std::env::var("MAPBOX_TOKEN").ok();
     let frontend_log_writer = Arc::new(FrontendLogWriter::new("../frontend/logs")?);
     let state = Arc::new(AppState {
-        elevation_service: ElevationService::new(),
+        elevation_service: ElevationService::new(mapbox_token),
         osm_service: OsmService::new(),
         frontend_log_writer,
     });
