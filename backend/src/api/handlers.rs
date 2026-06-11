@@ -2,7 +2,6 @@ use crate::models::{
     BoundingBox, Building, GenerateRequest, GenerateResponse, MeshData, MeshStats, TerrainMesh,
 };
 use crate::services::{ElevationService, OsmService};
-use crate::services::osm::MAX_AREA_FOR_BUILDINGS_KM2;
 use crate::utils::{
     CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshExporter, MeshGenerator,
 };
@@ -163,25 +162,28 @@ pub async fn generate_terrain(
     // ═══════════════════════════════════════════════════════════════
     tracing::info!("─────────────────────────────────────────────────────────────────");
     let step_start = std::time::Instant::now();
+    // Print-resolution-aware footprint filter: drop buildings whose printed
+    // footprint would be smaller than MIN_PRINTED_FOOTPRINT_MM2. On a small
+    // bbox this stays at the 10 m² floor (everything prints); on a 20 km² city
+    // it rises to ~100+ m², keeping blocks and landmarks while shedding the
+    // sub-millimetre houses that would only bloat the mesh.
+    let min_building_area_m2 = {
+        const MIN_PRINTED_FOOTPRINT_MM2: f64 = 0.2;
+        let center_lat = ((request.bbox.min_lat + request.bbox.max_lat) / 2.0).to_radians();
+        let lat_extent_m = (request.bbox.max_lat - request.bbox.min_lat) * 111_320.0;
+        let lon_extent_m = (request.bbox.max_lon - request.bbox.min_lon) * 111_320.0 * center_lat.cos();
+        let mm_per_m = print_size_mm as f64 / lat_extent_m.max(lon_extent_m).max(1.0);
+        MIN_PRINTED_FOOTPRINT_MM2 / (mm_per_m * mm_per_m)
+    };
+
     let mut buildings = if !include_buildings {
         tracing::info!("🏢 STEP 4/8: Skipping building data (disabled by user)");
-        Vec::new()
-    } else if area_km2 > MAX_AREA_FOR_BUILDINGS_KM2 {
-        tracing::info!(
-            "🏢 STEP 4/8: Skipping buildings — area {:.2} km² > {:.0} km² threshold",
-            area_km2, MAX_AREA_FOR_BUILDINGS_KM2
-        );
-        tracing::info!(
-            "   └─ At this scale buildings would be <{}mm on a {:.0}mm print (below printer resolution)",
-            (10.0 / (area_km2 * 1e6_f64).sqrt() * print_size_mm as f64) as u32,
-            print_size_mm
-        );
         Vec::new()
     } else {
         tracing::info!("🏢 STEP 4/8: Fetching building data from OpenStreetMap (Overpass API)");
         tracing::info!("   └─ This step makes an HTTP request to Overpass API...");
 
-        match state.osm_service.fetch_buildings(&request.bbox).await {
+        match state.osm_service.fetch_buildings(&request.bbox, min_building_area_m2).await {
             Ok(b) => {
                 if b.is_empty() {
                     tracing::info!("   ⚠ No buildings found in this area");

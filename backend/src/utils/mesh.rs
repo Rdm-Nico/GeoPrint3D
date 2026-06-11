@@ -67,6 +67,21 @@ fn ring_centroid(pts: &[(f32, f32)]) -> (f32, f32) {
     (cx / (3.0 * a), cy / (3.0 * a))
 }
 
+/// True when the triangle set forms a closed 2-manifold surface
+/// (every undirected edge is used by exactly two triangles).
+fn solid_is_closed(triangles: &[[usize; 3]]) -> bool {
+    let mut edges: std::collections::HashMap<(usize, usize), i32> =
+        std::collections::HashMap::with_capacity(triangles.len() * 3 / 2);
+    for t in triangles {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            let key = if a < b { (a, b) } else { (b, a) };
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+    edges.values().all(|&c| c == 2)
+}
+
 /// Axis-aligned bbox of a ring: [min_x, min_y, max_x, max_y].
 fn ring_bbox(pts: &[(f32, f32)]) -> [f32; 4] {
     let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
@@ -587,7 +602,56 @@ impl MeshGenerator {
         Ok(clean)
     }
 
-    /// Add a single building solid, placing its base on the terrain surface.
+    /// Add a single building solid, verifying it is combinatorially CLOSED
+    /// (every edge shared by exactly two triangles). Ear clipping occasionally
+    /// degenerates on awkward real-world footprints (hole bridges reusing an
+    /// edge, collinear runs from bbox clipping); instead of poisoning the whole
+    /// mesh, such a solid is rolled back and retried without courtyard holes,
+    /// and skipped entirely if even that fails.
+    fn add_building_to_mesh(
+        &self,
+        mesh: &mut TerrainMesh,
+        building: &Building,
+        outer: &[(f32, f32)],
+        holes: &[Vec<(f32, f32)>],
+        base_elevation: f32,
+    ) -> Result<BuildingPlacement> {
+        let (v0, t0) = (mesh.vertices.len(), mesh.triangles.len());
+        let rollback = |mesh: &mut TerrainMesh| {
+            mesh.vertices.truncate(v0);
+            mesh.triangles.truncate(t0);
+        };
+
+        match self.emit_building_solid(mesh, building, outer, holes, base_elevation) {
+            Ok(p) if solid_is_closed(&mesh.triangles[t0..]) => return Ok(p),
+            Ok(_) => rollback(mesh),
+            Err(e) => {
+                rollback(mesh);
+                return Err(e);
+            }
+        }
+
+        if holes.is_empty() {
+            anyhow::bail!("solid not closed (degenerate footprint)");
+        }
+        tracing::debug!(
+            "   │  Building {}: courtyard triangulation degenerated — retrying without holes",
+            building.id
+        );
+        match self.emit_building_solid(mesh, building, outer, &[], base_elevation) {
+            Ok(p) if solid_is_closed(&mesh.triangles[t0..]) => Ok(p),
+            Ok(_) => {
+                rollback(mesh);
+                anyhow::bail!("solid not closed even without holes");
+            }
+            Err(e) => {
+                rollback(mesh);
+                Err(e)
+            }
+        }
+    }
+
+    /// Emit the raw geometry for one building solid.
     ///
     /// Geometry layout:
     ///   - one bottom ring + one top (eave) ring per boundary ring (outer + holes)
@@ -596,7 +660,7 @@ impl MeshGenerator {
     ///   - roof on the outer top ring according to `roof_shape` (flat cap, ridge,
     ///     pyramid, dome rings, …). Every roof closes the top ring with the same
     ///     ring edges the walls use, so each solid stays combinatorially closed.
-    fn add_building_to_mesh(
+    fn emit_building_solid(
         &self,
         mesh: &mut TerrainMesh,
         building: &Building,

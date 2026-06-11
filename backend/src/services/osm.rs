@@ -11,11 +11,15 @@ const OVERPASS_ENDPOINTS: &[&str] = &[
     "https://overpass.private.coffee/api/interpreter",
 ];
 
-// Buildings below this footprint (m²) are sub-pixel at print scale and skipped.
+// Hard floor for the footprint filter (m²): below this a building is sub-pixel
+// on ANY print. The effective threshold grows with the mapped area (the handler
+// passes a print-resolution-aware value).
 const MIN_BUILDING_AREA_M2: f64 = 10.0;
 
-// Above this area, buildings would be < 1 mm on a 100 mm print — skip the query.
-pub const MAX_AREA_FOR_BUILDINGS_KM2: f64 = 5.0;
+// A single Overpass / OSM-API query never covers more than this area: dense-city
+// responses above it time out or exceed the OSM API 50k-node limit. Larger
+// requests are split into a tile grid and merged.
+const TILE_MAX_KM2: f64 = 4.0;
 
 // A building outline is suppressed when ground-level building:part elements
 // cover at least this fraction of its footprint (Simple 3D Buildings: parts
@@ -29,6 +33,50 @@ struct HeightSources {
     levels: usize,
     default: usize,
     skipped: usize,
+}
+
+/// Accumulated diagnostics across all tiles of one fetch.
+#[derive(Default)]
+struct FetchStats {
+    src: HeightSources,
+    relations: usize,
+}
+
+// A failed tile is split 2×2 and retried, at most this many times
+// (4 km² → 1 km² → 0.25 km²). Catches both Overpass stalls on dense tiles and
+// the OSM-API 50k-node limit.
+const MAX_TILE_SPLIT_DEPTH: u8 = 2;
+
+/// Split a bbox into an `nx` × `ny` grid.
+fn split_bbox_grid(bbox: &BoundingBox, nx: usize, ny: usize) -> Vec<BoundingBox> {
+    let dlon = (bbox.max_lon - bbox.min_lon) / nx as f64;
+    let dlat = (bbox.max_lat - bbox.min_lat) / ny as f64;
+    let mut tiles = Vec::with_capacity(nx * ny);
+    for iy in 0..ny {
+        for ix in 0..nx {
+            tiles.push(BoundingBox {
+                min_lat: bbox.min_lat + dlat * iy as f64,
+                max_lat: bbox.min_lat + dlat * (iy + 1) as f64,
+                min_lon: bbox.min_lon + dlon * ix as f64,
+                max_lon: bbox.min_lon + dlon * (ix + 1) as f64,
+            });
+        }
+    }
+    tiles
+}
+
+/// Split a bbox into a grid of tiles no larger than `max_km2` each.
+/// Small bboxes come back unchanged (single tile).
+fn split_bbox(bbox: &BoundingBox, max_km2: f64) -> Vec<BoundingBox> {
+    let lat_km = (bbox.max_lat - bbox.min_lat) * 111.0;
+    let lon_km = (bbox.max_lon - bbox.min_lon) * 111.0 * bbox.min_lat.to_radians().cos();
+    if lat_km * lon_km <= max_km2 {
+        return vec![bbox.clone()];
+    }
+    let tile_side_km = max_km2.sqrt();
+    let nx = (lon_km / tile_side_km).ceil().max(1.0) as usize;
+    let ny = (lat_km / tile_side_km).ceil().max(1.0) as usize;
+    split_bbox_grid(bbox, nx, ny)
 }
 
 pub struct OsmService {
@@ -58,25 +106,107 @@ impl OsmService {
     ///   1. Overpass mirrors 1-3 — compact `out geom` query, no recurse step.
     ///   2. OSM direct API    — `api.openstreetmap.org/api/0.6/map.json`, OSMF-maintained,
     ///                          much more available than community Overpass instances.
-    pub async fn fetch_buildings(&self, bbox: &BoundingBox) -> Result<Vec<Building>> {
+    /// `min_area_m2` is the print-resolution-aware footprint filter computed by
+    /// the handler (floored at MIN_BUILDING_AREA_M2 here).
+    pub async fn fetch_buildings(&self, bbox: &BoundingBox, min_area_m2: f64) -> Result<Vec<Building>> {
         tracing::info!("   ┌─ OpenStreetMap Building Service");
         tracing::info!(
             "   │  Bbox: ({:.4}, {:.4}) → ({:.4}, {:.4})",
             bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon
         );
+        let min_area_m2 = min_area_m2.max(MIN_BUILDING_AREA_M2);
+        tracing::info!("   │  Footprint filter: ≥ {:.0} m² (print-resolution aware)", min_area_m2);
 
         let request_start = std::time::Instant::now();
+        let tiles = split_bbox(bbox, TILE_MAX_KM2);
+        if tiles.len() > 1 {
+            tracing::info!("   │  Large area: split into {} tiles of ≤ {} km²", tiles.len(), TILE_MAX_KM2);
+        }
 
+        // Elements spanning tile borders are returned by every tile they touch;
+        // dedupe by (is_relation, id). Geometry is identical in each occurrence
+        // because clipping always uses the FULL request bbox.
+        let mut seen: std::collections::HashSet<(bool, u64)> = std::collections::HashSet::new();
+        let mut buildings: Vec<Building> = Vec::new();
+        let mut stats = FetchStats::default();
+        let mut ok_tiles = 0usize;
+        let mut failed_tiles = 0usize;
+
+        // Work queue: a failed tile is quartered and re-queued (smaller queries
+        // dodge Overpass stalls and the OSM-API node limit) until
+        // MAX_TILE_SPLIT_DEPTH, after which it counts as failed.
+        let mut queue: std::collections::VecDeque<(BoundingBox, u8)> =
+            tiles.into_iter().map(|t| (t, 0u8)).collect();
+        let mut tile_no = 0usize;
+
+        while let Some((tile, depth)) = queue.pop_front() {
+            tile_no += 1;
+            match self
+                .fetch_tile(&tile, bbox, min_area_m2, tile_no, &mut seen, &mut buildings, &mut stats)
+                .await
+            {
+                Ok(source) => {
+                    ok_tiles += 1;
+                    tracing::info!(
+                        "   │  Tile {} (depth {}): ok via {} ({} elements so far, {:.1}s)",
+                        tile_no, depth, source, buildings.len(),
+                        request_start.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) if depth < MAX_TILE_SPLIT_DEPTH => {
+                    tracing::warn!(
+                        "   │  Tile {} (depth {}) failed: {} — splitting 2×2 and retrying",
+                        tile_no, depth, e
+                    );
+                    for sub in split_bbox_grid(&tile, 2, 2) {
+                        queue.push_back((sub, depth + 1));
+                    }
+                }
+                Err(e) => {
+                    failed_tiles += 1;
+                    tracing::warn!("   │  Tile {} (depth {}) FAILED permanently: {}", tile_no, depth, e);
+                }
+            }
+        }
+
+        if ok_tiles == 0 && failed_tiles > 0 {
+            anyhow::bail!("all OSM tile fetches failed ({} tiles)", failed_tiles);
+        }
+        if failed_tiles > 0 {
+            tracing::warn!(
+                "   │  ⚠ {} tile(s) failed permanently — building coverage is PARTIAL",
+                failed_tiles
+            );
+        }
+
+        let suppressed = suppress_covered_outlines(&mut buildings);
+        log_building_stats(&buildings, &stats.src, stats.relations, suppressed, request_start.elapsed());
+        Ok(buildings)
+    }
+
+    /// Fetch one tile: Overpass mirrors first, OSM direct API as fallback.
+    /// Parsed buildings are clipped against `clip_bbox` (the full request bbox)
+    /// and appended to `out`. Returns the source that served the tile.
+    async fn fetch_tile(
+        &self,
+        tile: &BoundingBox,
+        clip_bbox: &BoundingBox,
+        min_area_m2: f64,
+        tile_no: usize,
+        seen: &mut std::collections::HashSet<(bool, u64)>,
+        out: &mut Vec<Building>,
+        stats: &mut FetchStats,
+    ) -> Result<&'static str> {
         // ── Step 1: Overpass mirrors ──────────────────────────────────────────
         // `out geom qt` returns coordinates inline — ~10× smaller than
         // `out body;>;out skel qt` because no separate node objects are emitted.
         // Relations include per-member geometry and roles (outer/inner).
         let bb = format!(
             "{},{},{},{}",
-            bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon
+            tile.min_lat, tile.min_lon, tile.max_lat, tile.max_lon
         );
         let overpass_query = format!(
-            "[out:json][timeout:25];(\
+            "[out:json][timeout:30];(\
              way[\"building\"][\"building\"!=\"no\"]({bb});\
              way[\"building:part\"][\"building:part\"!=\"no\"]({bb});\
              relation[\"type\"=\"multipolygon\"][\"building\"][\"building\"!=\"no\"]({bb});\
@@ -84,14 +214,18 @@ impl OsmService {
              );out geom qt;"
         );
 
-        for (i, &endpoint) in OVERPASS_ENDPOINTS.iter().enumerate() {
-            tracing::info!("   │  Overpass attempt {}/{}: {}", i + 1, OVERPASS_ENDPOINTS.len(), endpoint);
+        // Rotate the starting mirror per tile so multi-tile fetches spread load
+        // instead of stalling on the same rate-limited mirror every time.
+        let n_mirrors = OVERPASS_ENDPOINTS.len();
+        for i in 0..n_mirrors {
+            let endpoint = OVERPASS_ENDPOINTS[(tile_no + i) % n_mirrors];
+            tracing::debug!("   │  Overpass attempt {}/{}: {}", i + 1, n_mirrors, endpoint);
 
             let resp = match self
                 .client
                 .post(endpoint)
                 .form(&[("data", &overpass_query)])
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(25))
                 .send()
                 .await
             {
@@ -103,14 +237,11 @@ impl OsmService {
             };
 
             let status = resp.status();
-            tracing::info!("   │  Status: {} ({:.2}s)", status, request_start.elapsed().as_secs_f64());
-
             match status.as_u16() {
                 200..=299 => {
                     let data: Value = resp.json().await.context("Failed to parse Overpass JSON")?;
-                    let elapsed = request_start.elapsed();
-                    tracing::info!("   │  Source: Overpass (out geom)");
-                    return self.parse_geom_response(data, bbox, elapsed);
+                    self.parse_geom_response(data, clip_bbox, min_area_m2, seen, out, stats)?;
+                    return Ok("Overpass (out geom)");
                 }
                 429 | 406 => {
                     tracing::warn!("   │  Rate-limited / rejected — trying next mirror");
@@ -129,33 +260,22 @@ impl OsmService {
         // Overpass because it is the primary OSMF-maintained endpoint.
         // Note: bbox order is west,south,east,north (lon,lat,lon,lat).
         tracing::info!("   │  All Overpass mirrors failed — falling back to OSM direct API");
-        self.fetch_buildings_osm_api(bbox, request_start).await
-    }
-
-    async fn fetch_buildings_osm_api(
-        &self,
-        bbox: &BoundingBox,
-        request_start: std::time::Instant,
-    ) -> Result<Vec<Building>> {
         let url = format!(
             "https://api.openstreetmap.org/api/0.6/map.json?bbox={},{},{},{}",
-            bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat
+            tile.min_lon, tile.min_lat, tile.max_lon, tile.max_lat
         );
-        tracing::info!("   │  OSM API: {}", url);
 
         let resp = self
             .client
             .get(&url)
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(25))
             .send()
             .await
             .context("Failed to connect to OSM direct API")?;
 
         let status = resp.status();
-        tracing::info!("   │  Status: {} ({:.2}s)", status, request_start.elapsed().as_secs_f64());
-
         if status.as_u16() == 509 {
-            anyhow::bail!("OSM API: bounding box too large (> 50 000 nodes) — area exceeds service limit");
+            anyhow::bail!("OSM API: tile too dense (> 50 000 nodes)");
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -163,9 +283,8 @@ impl OsmService {
         }
 
         let data: Value = resp.json().await.context("Failed to parse OSM API JSON")?;
-        let elapsed = request_start.elapsed();
-        tracing::info!("   │  Source: OSM direct API");
-        self.parse_noderefs_response(data, bbox, elapsed)
+        self.parse_noderefs_response(data, clip_bbox, min_area_m2, seen, out, stats)?;
+        Ok("OSM direct API")
     }
 
     // ── Parsers ───────────────────────────────────────────────────────────────
@@ -173,15 +292,20 @@ impl OsmService {
     /// Parse an Overpass `out geom` response.
     /// Ways carry a `geometry` array with inline lat/lon objects; relations carry
     /// per-member geometry with `outer`/`inner` roles.
-    fn parse_geom_response(&self, data: Value, bbox: &BoundingBox, elapsed: Duration) -> Result<Vec<Building>> {
+    fn parse_geom_response(
+        &self,
+        data: Value,
+        bbox: &BoundingBox,
+        min_area_m2: f64,
+        seen: &mut std::collections::HashSet<(bool, u64)>,
+        out: &mut Vec<Building>,
+        stats: &mut FetchStats,
+    ) -> Result<()> {
         let elements = data["elements"]
             .as_array()
             .context("Missing 'elements' in Overpass response")?;
 
         tracing::info!("   │  Received {} OSM elements", elements.len());
-        let mut buildings = Vec::new();
-        let mut src = HeightSources::default();
-        let mut relations = 0usize;
 
         for el in elements.iter() {
             let tags = &el["tags"];
@@ -189,21 +313,27 @@ impl OsmService {
 
             match el["type"].as_str().unwrap_or("") {
                 "way" => {
+                    if !seen.insert((false, id)) {
+                        continue; // already parsed via a neighbouring tile
+                    }
                     let Some(geometry) = el["geometry"].as_array() else {
-                        src.skipped += 1;
+                        stats.src.skipped += 1;
                         continue;
                     };
                     let footprint: Vec<(f64, f64)> = geometry
                         .iter()
                         .filter_map(|g| Some((g["lon"].as_f64()?, g["lat"].as_f64()?)))
                         .collect();
-                    push_building(&mut buildings, id, footprint, Vec::new(), tags, bbox, &mut src);
+                    push_building(out, id, footprint, Vec::new(), tags, bbox, min_area_m2, &mut stats.src);
                 }
                 "relation" => {
+                    if !seen.insert((true, id)) {
+                        continue;
+                    }
                     let Some(members) = el["members"].as_array() else {
                         continue;
                     };
-                    relations += 1;
+                    stats.relations += 1;
                     let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
                     let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
                     for m in members {
@@ -223,21 +353,27 @@ impl OsmService {
                             outer_segments.push(line);
                         }
                     }
-                    push_relation(&mut buildings, id, outer_segments, inner_segments, tags, bbox, &mut src);
+                    push_relation(out, id, outer_segments, inner_segments, tags, bbox, min_area_m2, &mut stats.src);
                 }
                 _ => {}
             }
         }
 
-        let suppressed = suppress_covered_outlines(&mut buildings);
-        log_building_stats(&buildings, &src, relations, suppressed, elapsed);
-        Ok(buildings)
+        Ok(())
     }
 
     /// Parse an OSM direct API response (node-ref format).
     /// Ways reference node IDs; relations reference way IDs. Coordinates are
     /// resolved through the node list.
-    fn parse_noderefs_response(&self, data: Value, bbox: &BoundingBox, elapsed: Duration) -> Result<Vec<Building>> {
+    fn parse_noderefs_response(
+        &self,
+        data: Value,
+        bbox: &BoundingBox,
+        min_area_m2: f64,
+        seen: &mut std::collections::HashSet<(bool, u64)>,
+        out: &mut Vec<Building>,
+        stats: &mut FetchStats,
+    ) -> Result<()> {
         let elements = data["elements"]
             .as_array()
             .context("Missing 'elements' in OSM API response")?;
@@ -274,10 +410,6 @@ impl OsmService {
             ways.insert(id, coords);
         }
 
-        let mut buildings = Vec::new();
-        let mut src = HeightSources::default();
-        let mut relations = 0usize;
-
         for el in elements.iter() {
             let tags = &el["tags"];
             let id = el["id"].as_u64().unwrap_or(0);
@@ -289,21 +421,27 @@ impl OsmService {
 
             match el["type"].as_str().unwrap_or("") {
                 "way" => {
-                    let footprint = ways.get(&id).cloned().unwrap_or_default();
-                    if footprint.len() < 3 {
-                        src.skipped += 1;
+                    if !seen.insert((false, id)) {
                         continue;
                     }
-                    push_building(&mut buildings, id, footprint, Vec::new(), tags, bbox, &mut src);
+                    let footprint = ways.get(&id).cloned().unwrap_or_default();
+                    if footprint.len() < 3 {
+                        stats.src.skipped += 1;
+                        continue;
+                    }
+                    push_building(out, id, footprint, Vec::new(), tags, bbox, min_area_m2, &mut stats.src);
                 }
                 "relation" => {
                     if tags["type"] != "multipolygon" {
                         continue;
                     }
+                    if !seen.insert((true, id)) {
+                        continue;
+                    }
                     let Some(members) = el["members"].as_array() else {
                         continue;
                     };
-                    relations += 1;
+                    stats.relations += 1;
                     let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
                     let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
                     for m in members {
@@ -322,15 +460,13 @@ impl OsmService {
                             outer_segments.push(coords);
                         }
                     }
-                    push_relation(&mut buildings, id, outer_segments, inner_segments, tags, bbox, &mut src);
+                    push_relation(out, id, outer_segments, inner_segments, tags, bbox, min_area_m2, &mut stats.src);
                 }
                 _ => {}
             }
         }
 
-        let suppressed = suppress_covered_outlines(&mut buildings);
-        log_building_stats(&buildings, &src, relations, suppressed, elapsed);
-        Ok(buildings)
+        Ok(())
     }
 }
 
@@ -348,13 +484,14 @@ fn push_building(
     holes: Vec<Vec<(f64, f64)>>,
     tags: &Value,
     bbox: &BoundingBox,
+    min_area_m2: f64,
     src: &mut HeightSources,
 ) {
     // Inference (roof shape from a quad footprint) looks at the original
     // corner count, not the clip-induced one.
     let corners = corner_count(&footprint);
     let footprint = clip_ring_to_bbox(&footprint, bbox);
-    if footprint.len() < 3 || footprint_area_m2(&footprint) < MIN_BUILDING_AREA_M2 {
+    if footprint.len() < 3 || footprint_area_m2(&footprint) < min_area_m2 {
         src.skipped += 1;
         return;
     }
@@ -440,6 +577,7 @@ fn push_relation(
     inner_segments: Vec<Vec<(f64, f64)>>,
     tags: &Value,
     bbox: &BoundingBox,
+    min_area_m2: f64,
     src: &mut HeightSources,
 ) {
     let outer_rings = assemble_rings(outer_segments);
@@ -450,7 +588,7 @@ fn push_relation(
             .filter(|h| !h.is_empty() && point_in_ring(h[0], &ring))
             .cloned()
             .collect();
-        push_building(buildings, id, ring, holes, tags, bbox, src);
+        push_building(buildings, id, ring, holes, tags, bbox, min_area_m2, src);
     }
 }
 
