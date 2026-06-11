@@ -80,10 +80,52 @@ pub struct ElevationPoint {
     pub elevation: f32,  // in meters
 }
 
+/// Roof geometry classes derived from the OSM `roof:shape` tag.
+/// Unrecognised values fall back to `Flat` (the safe, always-watertight cap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoofShape {
+    Flat,
+    Gabled,
+    Hipped,
+    Pyramidal,
+    Dome,
+    Skillion,
+}
+
+impl RoofShape {
+    pub fn from_tag(tag: &str) -> Self {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "gabled" | "gable" | "gambrel" | "saltbox" | "round" => RoofShape::Gabled,
+            "hipped" | "hip" | "half-hipped" | "mansard" => RoofShape::Hipped,
+            "pyramidal" | "pyramid" => RoofShape::Pyramidal,
+            "dome" | "onion" | "cone" | "conical" => RoofShape::Dome,
+            "skillion" | "lean_to" | "shed" | "sloped" => RoofShape::Skillion,
+            _ => RoofShape::Flat,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            RoofShape::Flat => "flat",
+            RoofShape::Gabled => "gabled",
+            RoofShape::Hipped => "hipped",
+            RoofShape::Pyramidal => "pyramidal",
+            RoofShape::Dome => "dome",
+            RoofShape::Skillion => "skillion",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Building {
-    pub footprint: Vec<(f64, f64)>,  // (lon, lat) coordinates
-    pub height: f32,  // in meters
+    pub id: u64,                          // OSM element id (way or relation)
+    pub footprint: Vec<(f64, f64)>,       // outer ring, (lon, lat)
+    pub holes: Vec<Vec<(f64, f64)>>,      // inner rings (courtyards), (lon, lat)
+    pub height: f32,                      // total height in meters, roof included
+    pub min_height: f32,                  // bottom of the solid (building:part stacking)
+    pub roof_shape: RoofShape,
+    pub roof_height: f32,                 // meters of `height` taken by the roof; 0 = auto
+    pub is_part: bool,                    // true for building:part elements
 }
 
 #[derive(Debug)]

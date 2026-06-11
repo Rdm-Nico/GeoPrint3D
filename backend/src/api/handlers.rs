@@ -1,7 +1,11 @@
-use crate::models::{GenerateRequest, GenerateResponse, MeshData, MeshStats};
+use crate::models::{
+    BoundingBox, Building, GenerateRequest, GenerateResponse, MeshData, MeshStats, TerrainMesh,
+};
 use crate::services::{ElevationService, OsmService};
 use crate::services::osm::MAX_AREA_FOR_BUILDINGS_KM2;
-use crate::utils::{CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshGenerator};
+use crate::utils::{
+    CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshExporter, MeshGenerator,
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -209,24 +213,41 @@ pub async fn generate_terrain(
         const KNEE_FLOOR_M: f32 = 20.0;
         const SLOPE: f32 = 0.30;
 
-        let mut sorted: Vec<f32> = buildings.iter().map(|b| b.height).collect();
+        // Median over outlines only: a decomposed landmark (St Peter's has dozens
+        // of building:part elements, many of them tall) would otherwise drag the
+        // knee upward and escape compression.
+        let mut sorted: Vec<f32> = buildings.iter().filter(|b| !b.is_part).map(|b| b.height).collect();
+        if sorted.is_empty() {
+            sorted = buildings.iter().map(|b| b.height).collect();
+        }
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = sorted[sorted.len() / 2];
         let knee = (median * KNEE_MULT).max(KNEE_FLOOR_M);
-        let max_before = *sorted.last().unwrap();
+        let max_before = buildings.iter().map(|b| b.height).fold(0.0f32, f32::max);
+
+        // One monotone map applied to every vertical coordinate (top, eave,
+        // min_height) keeps stacked building:part solids aligned: the eave of a
+        // drum still meets the min_height of the dome above it.
+        let compress = |h: f32| if h > knee { knee + (h - knee) * SLOPE } else { h };
 
         let mut compressed = 0usize;
         let mut max_after = 0.0f32;
         for b in &mut buildings {
-            if b.height > knee {
-                b.height = knee + (b.height - knee) * SLOPE;
+            let new_top = compress(b.height);
+            if new_top < b.height {
                 compressed += 1;
+                if b.roof_height > 0.0 {
+                    let eave = (b.height - b.roof_height).max(0.0);
+                    b.roof_height = (new_top - compress(eave)).max(0.0);
+                }
+                b.height = new_top;
             }
+            b.min_height = compress(b.min_height);
             max_after = max_after.max(b.height);
         }
         if compressed > 0 {
             tracing::info!(
-                "   └─ Height compression: median {:.0}m, knee {:.0}m → compressed {} building(s); max {:.0}m → {:.0}m",
+                "   └─ Height compression: median {:.0}m, knee {:.0}m → compressed {} element(s); max {:.0}m → {:.0}m",
                 median, knee, compressed, max_before, max_after
             );
         }
@@ -350,6 +371,7 @@ pub async fn generate_terrain(
     // ═══════════════════════════════════════════════════════════════
     tracing::info!("─────────────────────────────────────────────────────────────────");
     let step_start = std::time::Instant::now();
+    let mut placements = Vec::new();
     if !buildings.is_empty() {
         tracing::info!("🏗️  STEP 7/8: Adding {} building extrusions to mesh", buildings.len());
         tracing::info!("   └─ Buildings placed on terrain surface (not at sea level)");
@@ -357,7 +379,7 @@ pub async fn generate_terrain(
         let vertices_before = mesh.vertices.len();
         let triangles_before = mesh.triangles.len();
 
-        mesh_generator.add_buildings(&mut mesh, &buildings, terrain_vertex_count)
+        placements = mesh_generator.add_buildings(&mut mesh, &buildings, terrain_vertex_count)
             .map_err(|e| {
                 tracing::error!("   ✗ FAILED to add buildings: {}", e);
                 ApiError::InternalError(format!("Building extrusion failed: {}", e))
@@ -428,6 +450,26 @@ pub async fn generate_terrain(
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // Debug artifacts: geometry report (always) + STL dump (env-gated)
+    // ═══════════════════════════════════════════════════════════════
+    write_geometry_report(
+        &request.bbox,
+        &buildings,
+        &placements,
+        &mesh,
+        terrain_triangle_count,
+        building_triangle_count,
+        is_manifold,
+    );
+    if std::env::var("DEBUG_DUMP_STL").map(|v| v != "0").unwrap_or(false) {
+        let path = std::path::Path::new("logs/last_mesh.stl");
+        match MeshExporter::export_stl(&mesh, path) {
+            Ok(_) => tracing::info!("🧪 Debug STL dumped to {}", path.display()),
+            Err(e) => tracing::warn!("Failed to dump debug STL: {}", e),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // Calculate final statistics
     // ═══════════════════════════════════════════════════════════════
     let stats = MeshStats {
@@ -470,6 +512,88 @@ pub async fn generate_terrain(
         stats,
         mesh_data,
     }))
+}
+
+/// Write a per-generation geometry report to `logs/last_geometry.json` so the
+/// building geometry can be evaluated without a 3D viewer: roof-shape histogram,
+/// building:part / courtyard counts, the tallest elements, and mesh integrity.
+fn write_geometry_report(
+    bbox: &BoundingBox,
+    buildings: &[Building],
+    placements: &[crate::utils::mesh::BuildingPlacement],
+    mesh: &TerrainMesh,
+    terrain_triangles: usize,
+    building_triangles: usize,
+    is_manifold: bool,
+) {
+    use std::collections::BTreeMap;
+
+    let mut roof_shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for b in buildings {
+        *roof_shapes.entry(b.roof_shape.name()).or_insert(0) += 1;
+    }
+
+    // placements is index-aligned with buildings (one record per input element).
+    let building_json = |(i, b): (usize, &Building)| {
+        let mut v = serde_json::json!({
+            "id": b.id,
+            "is_part": b.is_part,
+            "height_m": b.height,
+            "min_height_m": b.min_height,
+            "roof": b.roof_shape.name(),
+            "roof_height_m": b.roof_height,
+            "holes": b.holes.len(),
+            "footprint_vertices": b.footprint.len(),
+        });
+        if let Some(p) = placements.get(i) {
+            v["placement"] = serde_json::json!({
+                "base_elevation_z": p.base_elevation,
+                "bottom_z": p.bottom_z,
+                "eave_z": p.eave_z,
+                "top_z": p.top_z,
+                "roof_z": p.roof_z,
+                "vertices_added": p.vertices_added,
+                "skip_reason": p.skip_reason,
+            });
+        }
+        v
+    };
+
+    let mut by_height: Vec<(usize, &Building)> = buildings.iter().enumerate().collect();
+    by_height.sort_by(|a, b| b.1.height.partial_cmp(&a.1.height).unwrap_or(std::cmp::Ordering::Equal));
+    let tallest: Vec<serde_json::Value> = by_height.iter().take(15).map(|&e| building_json(e)).collect();
+
+    let report = serde_json::json!({
+        "generated_at": chrono::Local::now().to_rfc3339(),
+        "bbox": bbox,
+        "buildings": {
+            "total": buildings.len(),
+            "parts": buildings.iter().filter(|b| b.is_part).count(),
+            "with_courtyards": buildings.iter().filter(|b| !b.holes.is_empty()).count(),
+            "with_min_height": buildings.iter().filter(|b| b.min_height > 0.0).count(),
+            "roof_shapes": roof_shapes,
+        },
+        "mesh": {
+            "vertices": mesh.vertices.len(),
+            "triangles": mesh.triangles.len(),
+            "terrain_triangles": terrain_triangles,
+            "building_triangles": building_triangles,
+            "manifold": is_manifold,
+        },
+        "tallest_elements": tallest,
+        "elements": buildings.iter().enumerate().map(building_json).collect::<Vec<_>>(),
+    });
+
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write("logs/last_geometry.json", json) {
+                tracing::warn!("Failed to write geometry report: {}", e);
+            } else {
+                tracing::info!("📝 Geometry report written to logs/last_geometry.json");
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialise geometry report: {}", e),
+    }
 }
 
 /// Health check endpoint

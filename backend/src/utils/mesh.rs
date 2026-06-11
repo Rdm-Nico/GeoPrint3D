@@ -1,4 +1,4 @@
-use crate::models::{Building, ProjectedPoint, TerrainMesh};
+use crate::models::{Building, ProjectedPoint, RoofShape, TerrainMesh};
 use crate::utils::projection::CoordinateProjector;
 use anyhow::Result;
 
@@ -12,6 +12,230 @@ fn signed_area(pts: &[(f32, f32)]) -> f32 {
         a += x0 * y1 - x1 * y0;
     }
     a * 0.5
+}
+
+/// Where a building solid ended up, in mesh Z units (terrain-relative, BEFORE
+/// print normalization). `vertices_added == 0` means the element emitted no
+/// geometry — `skip_reason` says why. Used by the geometry debug report.
+#[derive(Debug, Clone)]
+pub struct BuildingPlacement {
+    pub id: u64,
+    pub base_elevation: f32,
+    pub bottom_z: f32,
+    pub eave_z: f32,
+    pub top_z: f32,
+    pub roof_z: f32,
+    pub vertices_added: usize,
+    pub skip_reason: Option<String>,
+}
+
+impl BuildingPlacement {
+    fn skipped(id: u64, reason: &str) -> Self {
+        Self {
+            id,
+            base_elevation: 0.0,
+            bottom_z: 0.0,
+            eave_z: 0.0,
+            top_z: 0.0,
+            roof_z: 0.0,
+            vertices_added: 0,
+            skip_reason: Some(reason.to_string()),
+        }
+    }
+}
+
+/// Area centroid of a simple polygon (vertex mean when the ring is degenerate).
+fn ring_centroid(pts: &[(f32, f32)]) -> (f32, f32) {
+    let n = pts.len();
+    let mut a = 0.0f32;
+    let (mut cx, mut cy) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % n];
+        let cross = x0 * y1 - x1 * y0;
+        a += cross;
+        cx += (x0 + x1) * cross;
+        cy += (y0 + y1) * cross;
+    }
+    if a.abs() < 1e-6 {
+        let inv = 1.0 / n.max(1) as f32;
+        return (
+            pts.iter().map(|p| p.0).sum::<f32>() * inv,
+            pts.iter().map(|p| p.1).sum::<f32>() * inv,
+        );
+    }
+    (cx / (3.0 * a), cy / (3.0 * a))
+}
+
+/// Axis-aligned bbox of a ring: [min_x, min_y, max_x, max_y].
+fn ring_bbox(pts: &[(f32, f32)]) -> [f32; 4] {
+    let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+    for &(x, y) in pts {
+        b[0] = b[0].min(x);
+        b[1] = b[1].min(y);
+        b[2] = b[2].max(x);
+        b[3] = b[3].max(y);
+    }
+    b
+}
+
+/// Ray-casting point-in-polygon test on projected coordinates.
+fn point_in_ring_f32(p: (f32, f32), ring: &[(f32, f32)]) -> bool {
+    let (px, py) = p;
+    let mut inside = false;
+    let n = ring.len();
+    for i in 0..n {
+        let (x0, y0) = ring[i];
+        let (x1, y1) = ring[(i + 1) % n];
+        if (y0 > py) != (y1 > py) {
+            let x_cross = x0 + (py - y0) / (y1 - y0) * (x1 - x0);
+            if px < x_cross {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Per-vertex eave heights for a skillion (single-slope) roof: lowest along the
+/// footprint's longest edge, rising linearly to the far side.
+fn skillion_heights(ring: &[(f32, f32)], eave_z: f32, roof_z: f32) -> Vec<f32> {
+    let n = ring.len();
+    let (mut best, mut best_len2) = (0usize, -1.0f32);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (dx, dy) = (ring[j].0 - ring[i].0, ring[j].1 - ring[i].1);
+        let len2 = dx * dx + dy * dy;
+        if len2 > best_len2 {
+            best_len2 = len2;
+            best = i;
+        }
+    }
+    let (ax, ay) = ring[best];
+    let (bx, by) = ring[(best + 1) % n];
+    let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt().max(1e-3);
+    let (nx, ny) = (-(by - ay) / len, (bx - ax) / len);
+    let dists: Vec<f32> = ring
+        .iter()
+        .map(|&(x, y)| ((x - ax) * nx + (y - ay) * ny).abs())
+        .collect();
+    let d_max = dists.iter().cloned().fold(0.0f32, f32::max).max(1e-3);
+    dists.iter().map(|d| eave_z + roof_z * d / d_max).collect()
+}
+
+/// Pyramid roof: a fan from every eave-ring edge to a single apex above the
+/// centroid. Combinatorially closed for any simple ring.
+fn add_pyramid_roof(mesh: &mut TerrainMesh, top0: usize, ring: &[(f32, f32)], apex_z: f32) {
+    let (cx, cy) = ring_centroid(ring);
+    let apex = mesh.vertices.len();
+    mesh.vertices.push([cx, cy, apex_z]);
+    let n = ring.len();
+    for i in 0..n {
+        mesh.triangles.push([top0 + i, top0 + (i + 1) % n, apex]);
+    }
+}
+
+/// Dome roof: stacked copies of the eave ring, shrunk toward the centroid with a
+/// cos profile and raised with a sin profile (quarter circle), closed by an apex
+/// fan. On a circular footprint this is a low-poly hemisphere scaled to roof_z.
+fn add_dome_roof(mesh: &mut TerrainMesh, top0: usize, ring: &[(f32, f32)], eave_z: f32, roof_z: f32) {
+    const SEGS: usize = 6;
+    let (cx, cy) = ring_centroid(ring);
+    let n = ring.len();
+    let mut prev: Vec<usize> = (top0..top0 + n).collect();
+    for k in 1..SEGS {
+        let t = (k as f32 / SEGS as f32) * std::f32::consts::FRAC_PI_2;
+        let s = t.cos();
+        let z = eave_z + roof_z * t.sin();
+        let start = mesh.vertices.len();
+        for &(x, y) in ring {
+            mesh.vertices.push([cx + (x - cx) * s, cy + (y - cy) * s, z]);
+        }
+        for i in 0..n {
+            let j = (i + 1) % n;
+            mesh.triangles.push([prev[i], prev[j], start + i]);
+            mesh.triangles.push([start + i, prev[j], start + j]);
+        }
+        prev = (start..start + n).collect();
+    }
+    let apex = mesh.vertices.len();
+    mesh.vertices.push([cx, cy, eave_z + roof_z]);
+    for i in 0..n {
+        mesh.triangles.push([prev[i], prev[(i + 1) % n], apex]);
+    }
+}
+
+/// Gabled / hipped roof over a quad footprint. The ridge runs between the
+/// midpoints of the two SHORT edges; `inset_frac` pulls the ridge endpoints
+/// toward each other (0 = gabled with vertical gable ends, ~0.3 = hipped).
+fn add_ridge_roof(
+    mesh: &mut TerrainMesh,
+    top0: usize,
+    ring: &[(f32, f32)],
+    ridge_z: f32,
+    inset_frac: f32,
+) {
+    debug_assert_eq!(ring.len(), 4);
+    let edge_len = |i: usize, j: usize| {
+        ((ring[j].0 - ring[i].0).powi(2) + (ring[j].1 - ring[i].1).powi(2)).sqrt()
+    };
+    // Rotate labels so the slope faces sit over the two LONG edges.
+    let idx: [usize; 4] = if edge_len(0, 1) + edge_len(2, 3) >= edge_len(1, 2) + edge_len(3, 0) {
+        [0, 1, 2, 3]
+    } else {
+        [1, 2, 3, 0]
+    };
+    let v = |k: usize| ring[idx[k]];
+    let mid = |a: (f32, f32), b: (f32, f32)| ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+    let ra = mid(v(1), v(2));
+    let rb = mid(v(3), v(0));
+    let lerp = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+    let (ra0, rb0) = (ra, rb);
+    let ra = lerp(ra0, rb0, inset_frac * 0.5);
+    let rb = lerp(rb0, ra0, inset_frac * 0.5);
+
+    let ia = mesh.vertices.len();
+    mesh.vertices.push([ra.0, ra.1, ridge_z]);
+    let ib = mesh.vertices.len();
+    mesh.vertices.push([rb.0, rb.1, ridge_z]);
+
+    let t = |k: usize| top0 + idx[k];
+    // Slope faces over the long edges…
+    mesh.triangles.push([t(0), t(1), ia]);
+    mesh.triangles.push([t(0), ia, ib]);
+    mesh.triangles.push([t(2), t(3), ib]);
+    mesh.triangles.push([t(2), ib, ia]);
+    // …and gable (or hip) faces over the short edges.
+    mesh.triangles.push([t(1), t(2), ia]);
+    mesh.triangles.push([t(3), t(0), ib]);
+}
+
+/// Fallback pitched roof for non-quad footprints: a frustum from the eave ring
+/// to an inset, raised copy of it, capped flat. `cap` is the ear-clip
+/// triangulation of the eave ring (valid for the inset ring too, since scaling
+/// toward the centroid is affine).
+fn add_frustum_roof(
+    mesh: &mut TerrainMesh,
+    top0: usize,
+    ring: &[(f32, f32)],
+    top_z: f32,
+    cap: &[usize],
+) {
+    const INSET_SCALE: f32 = 0.55;
+    let (cx, cy) = ring_centroid(ring);
+    let n = ring.len();
+    let start = mesh.vertices.len();
+    for &(x, y) in ring {
+        mesh.vertices.push([cx + (x - cx) * INSET_SCALE, cy + (y - cy) * INSET_SCALE, top_z]);
+    }
+    for i in 0..n {
+        let j = (i + 1) % n;
+        mesh.triangles.push([top0 + i, top0 + j, start + i]);
+        mesh.triangles.push([start + i, top0 + j, start + j]);
+    }
+    for t in cap.chunks_exact(3) {
+        mesh.triangles.push([start + t[0], start + t[1], start + t[2]]);
+    }
 }
 
 /// Coarse uniform-grid spatial index over terrain vertices for fast nearest-Z
@@ -179,12 +403,14 @@ impl MeshGenerator {
     /// Add building extrusions to the mesh.
     /// `terrain_vertex_count` is the number of terrain vertices already in the mesh —
     /// used to sample the terrain elevation beneath each building footprint.
+    /// Returns one placement record per input building (vertices_added == 0 means
+    /// the element produced no geometry) for the geometry debug report.
     pub fn add_buildings(
         &self,
         mesh: &mut TerrainMesh,
         buildings: &[Building],
         terrain_vertex_count: usize,
-    ) -> Result<()> {
+    ) -> Result<Vec<BuildingPlacement>> {
         tracing::info!("   ┌─ Mesh Generator: Building Extrusions");
         tracing::info!("   │  Buildings to process: {}", buildings.len());
         tracing::info!("   │  Building scale: {:.2}x", self.building_scale);
@@ -196,19 +422,127 @@ impl MeshGenerator {
         // elevation cheaply while mutably borrowing the mesh to push geometry.
         let terrain = TerrainIndex::build(mesh.vertices[..terrain_vertex_count].to_vec());
 
+        // ── Pass 1: project rings and resolve base elevations ────────────────
+        // Each building gets the MIN ground under its own footprint. Stacked
+        // building:part elements (min_height > 0) then ADOPT the base of the
+        // ground element containing their centroid: the DEM can vary by metres
+        // across one landmark, and independently-anchored parts end up floating
+        // above (or sunk into) the part they stand on.
+        struct Prepared {
+            outer: Vec<(f32, f32)>,
+            holes: Vec<Vec<(f32, f32)>>,
+            base: f32,
+        }
+        let mut prepared: Vec<Option<Prepared>> = Vec::with_capacity(buildings.len());
+        for building in buildings {
+            let mut outer = match self.project_clean_ring(&building.footprint) {
+                Ok(r) if r.len() >= 3 => r,
+                _ => {
+                    prepared.push(None);
+                    continue;
+                }
+            };
+            // Outer winds counter-clockwise so wall + cap normals point outward/up;
+            // holes wind clockwise so the same wall loop faces INTO the courtyard
+            // (also the conventional earcut orientation).
+            if signed_area(&outer) < 0.0 {
+                outer.reverse();
+            }
+            let mut holes = Vec::new();
+            for h in &building.holes {
+                if let Ok(mut ring) = self.project_clean_ring(h) {
+                    if ring.len() >= 3 {
+                        if signed_area(&ring) > 0.0 {
+                            ring.reverse();
+                        }
+                        // Pull the courtyard a hair toward its centroid: OSM inner
+                        // rings routinely share nodes/edges with the outer ring, and
+                        // a hole touching the boundary makes the ear-clip bridge
+                        // reuse an edge (non-manifold). ~0.1% is invisible in print.
+                        let (cx, cy) = ring_centroid(&ring);
+                        for p in ring.iter_mut() {
+                            p.0 = cx + (p.0 - cx) * 0.999;
+                            p.1 = cy + (p.1 - cy) * 0.999;
+                        }
+                        holes.push(ring);
+                    }
+                }
+            }
+            // Anchor the base to the LOWEST ground under the footprint. A single
+            // flat base on sloped terrain otherwise leaves large buildings floating
+            // (a gap on the downhill side) or sunk on the uphill side; taking the
+            // minimum embeds the uphill edge instead, so the building meets the ground.
+            let mut base = f32::INFINITY;
+            for &(x, y) in &outer {
+                if let Some(z) = terrain.nearest_z(x, y) {
+                    base = base.min(z);
+                }
+            }
+            if !base.is_finite() {
+                base = 0.0;
+            }
+            prepared.push(Some(Prepared { outer, holes, base }));
+        }
+
+        // Ground elements (anything starting at terrain level) that can support
+        // stacked parts: (index, bbox, area), most specific (smallest) first.
+        let mut supporters: Vec<(usize, [f32; 4], f32)> = Vec::new();
+        for (i, b) in buildings.iter().enumerate() {
+            if b.min_height < 0.5 {
+                if let Some(p) = &prepared[i] {
+                    let bb = ring_bbox(&p.outer);
+                    supporters.push((i, bb, (bb[2] - bb[0]) * (bb[3] - bb[1])));
+                }
+            }
+        }
+        supporters.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let adopted_bases: Vec<Option<f32>> = buildings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if b.min_height < 0.5 {
+                    return None;
+                }
+                let p = prepared[i].as_ref()?;
+                let c = ring_centroid(&p.outer);
+                supporters
+                    .iter()
+                    .find(|(j, bb, _)| {
+                        *j != i
+                            && c.0 >= bb[0] && c.0 <= bb[2]
+                            && c.1 >= bb[1] && c.1 <= bb[3]
+                            && point_in_ring_f32(c, &prepared[*j].as_ref().unwrap().outer)
+                    })
+                    .map(|(j, _, _)| prepared[*j].as_ref().unwrap().base)
+            })
+            .collect();
+        for (i, adopted) in adopted_bases.iter().enumerate() {
+            if let (Some(base), Some(p)) = (adopted, prepared[i].as_mut()) {
+                p.base = *base;
+            }
+        }
+
+        // ── Pass 2: extrude ──────────────────────────────────────────────────
+        let mut placements = Vec::with_capacity(buildings.len());
         let mut successful = 0;
         let mut skipped = 0;
 
         for (i, building) in buildings.iter().enumerate() {
-            if building.footprint.len() < 3 {
+            let Some(p) = &prepared[i] else {
                 skipped += 1;
+                placements.push(BuildingPlacement::skipped(building.id, "degenerate footprint"));
                 continue;
-            }
-            match self.add_building_to_mesh(mesh, building, &terrain) {
-                Ok(_) => successful += 1,
+            };
+            match self.add_building_to_mesh(mesh, building, &p.outer, &p.holes, p.base) {
+                Ok(p) => {
+                    successful += 1;
+                    placements.push(p);
+                }
                 Err(e) => {
                     tracing::debug!("   │  Skipped building {}: {}", i, e);
                     skipped += 1;
+                    placements.push(BuildingPlacement::skipped(building.id, &e.to_string()));
                 }
             }
         }
@@ -221,32 +555,22 @@ impl MeshGenerator {
         tracing::info!("   │    └─ Triangles added: {}", triangles_added);
         tracing::info!("   └─ Building extrusion complete");
 
-        Ok(())
+        Ok(placements)
     }
 
-    /// Add a single building extrusion, placing its base on the terrain surface.
-    fn add_building_to_mesh(
-        &self,
-        mesh: &mut TerrainMesh,
-        building: &Building,
-        terrain: &TerrainIndex,
-    ) -> Result<()> {
-        if building.footprint.len() < 3 {
-            return Ok(());
-        }
-
-        let mut footprint: Vec<(f32, f32)> = Vec::with_capacity(building.footprint.len());
-        for &(lon, lat) in &building.footprint {
-            let point = self.projector.project(lon, lat, 0.0)?;
-            footprint.push((point.x as f32, point.y as f32));
-        }
-
-        // Drop consecutive duplicate / near-duplicate vertices (incl. the repeated
-        // closing node of OSM ways). These create zero-area slivers that make earcut
-        // emit degenerate triangles and produce visible rendering artifacts.
+    /// Project a lon/lat ring to local metric coordinates and drop consecutive
+    /// duplicate / near-duplicate vertices (incl. the repeated closing node of
+    /// OSM ways). These create zero-area slivers that make earcut emit
+    /// degenerate triangles and produce visible rendering artifacts.
+    fn project_clean_ring(&self, ring: &[(f64, f64)]) -> Result<Vec<(f32, f32)>> {
         const EPS_M: f32 = 0.05;
-        let mut clean: Vec<(f32, f32)> = Vec::with_capacity(footprint.len());
-        for &p in &footprint {
+        let mut projected: Vec<(f32, f32)> = Vec::with_capacity(ring.len());
+        for &(lon, lat) in ring {
+            let point = self.projector.project(lon, lat, 0.0)?;
+            projected.push((point.x as f32, point.y as f32));
+        }
+        let mut clean: Vec<(f32, f32)> = Vec::with_capacity(projected.len());
+        for &p in &projected {
             if let Some(&last) = clean.last() {
                 if (p.0 - last.0).abs() < EPS_M && (p.1 - last.1).abs() < EPS_M {
                     continue;
@@ -260,70 +584,174 @@ impl MeshGenerator {
                 clean.pop();
             }
         }
-        footprint = clean;
-        let n = footprint.len();
-        if n < 3 {
-            return Ok(());
-        }
+        Ok(clean)
+    }
 
-        // Normalise winding to counter-clockwise so the top cap normal points +Z.
-        if signed_area(&footprint) < 0.0 {
-            footprint.reverse();
-        }
+    /// Add a single building solid, placing its base on the terrain surface.
+    ///
+    /// Geometry layout:
+    ///   - one bottom ring + one top (eave) ring per boundary ring (outer + holes)
+    ///   - walls between them (hole rings wind CW so their walls face the courtyard)
+    ///   - bottom cap (earcut with holes, facing −Z)
+    ///   - roof on the outer top ring according to `roof_shape` (flat cap, ridge,
+    ///     pyramid, dome rings, …). Every roof closes the top ring with the same
+    ///     ring edges the walls use, so each solid stays combinatorially closed.
+    fn add_building_to_mesh(
+        &self,
+        mesh: &mut TerrainMesh,
+        building: &Building,
+        outer: &[(f32, f32)],
+        holes: &[Vec<(f32, f32)>],
+        base_elevation: f32,
+    ) -> Result<BuildingPlacement> {
+        let vertices_at_start = mesh.vertices.len();
 
-        // Anchor the base to the LOWEST ground under the footprint. A single flat
-        // base on sloped terrain otherwise leaves large buildings floating (a gap
-        // on the downhill side) or sunk on the uphill side; taking the minimum
-        // embeds the uphill edge instead, so the building always meets the ground.
-        let mut base_elevation = f32::INFINITY;
-        for &(x, y) in &footprint {
-            if let Some(z) = terrain.nearest_z(x, y) {
-                base_elevation = base_elevation.min(z);
-            }
-        }
-        if !base_elevation.is_finite() {
-            base_elevation = 0.0;
-        }
-
+        // ── Vertical extent ──────────────────────────────────────────────────
         // building_scale is independent of terrain_scale so that building heights
         // stay proportional to reality even when terrain is heavily exaggerated.
-        let top_elevation = base_elevation + building.height * self.building_scale;
+        let bottom_z = base_elevation + building.min_height * self.building_scale;
+        let top_z = base_elevation + building.height * self.building_scale;
+        if top_z - bottom_z < 1e-3 {
+            anyhow::bail!("zero-height solid");
+        }
 
-        // Triangulate the (possibly concave) footprint with ear clipping.
-        let flat: Vec<f64> = footprint.iter().flat_map(|&(x, y)| [x as f64, y as f64]).collect();
-        let cap = earcutr::earcut(&flat, &[], 2)
+        // ── Roof selection ───────────────────────────────────────────────────
+        // Courtyard solids keep a flat roof: ridge/dome construction assumes a
+        // single boundary ring.
+        let shape = if holes.is_empty() { building.roof_shape } else { RoofShape::Flat };
+
+        // Footprint extent drives auto roof sizing (untagged roof heights).
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in outer {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        let min_extent = (max_x - min_x).min(max_y - min_y).max(0.1);
+
+        // Roof height in mesh Z units. XY stays in real metres until print
+        // normalization while Z carries building_scale, so footprint-derived
+        // auto heights (hemisphere = half the footprint width) are used as-is
+        // and only tag-derived metre values get multiplied by building_scale.
+        let mut roof_z = if shape == RoofShape::Flat {
+            0.0
+        } else if building.roof_height > 0.0 {
+            building.roof_height * self.building_scale
+        } else {
+            match shape {
+                RoofShape::Dome => 0.5 * min_extent,
+                _ => (3.0 * self.building_scale).min(0.4 * min_extent),
+            }
+        };
+        // The roof never swallows the walls entirely.
+        roof_z = roof_z.min(0.8 * (top_z - bottom_z));
+        let eave_z = top_z - roof_z;
+
+        // ── Vertex layout: bottom rings, then top (eave) rings ───────────────
+        let ring_sizes: Vec<usize> =
+            std::iter::once(outer.len()).chain(holes.iter().map(|h| h.len())).collect();
+        let total: usize = ring_sizes.iter().sum();
+
+        let base_index = mesh.vertices.len();
+        for &(x, y) in outer.iter().chain(holes.iter().flatten()) {
+            mesh.vertices.push([x, y, bottom_z]);
+        }
+
+        // Skillion roofs tilt the eave ring itself (lowest along the longest
+        // edge, rising to the far side); everything else has a level eave.
+        let top0 = mesh.vertices.len();
+        debug_assert_eq!(top0, base_index + total);
+        if shape == RoofShape::Skillion && roof_z > 0.0 {
+            let tilt = skillion_heights(&outer, eave_z, roof_z);
+            for (k, &(x, y)) in outer.iter().enumerate() {
+                mesh.vertices.push([x, y, tilt[k]]);
+            }
+        } else {
+            for &(x, y) in outer {
+                mesh.vertices.push([x, y, eave_z]);
+            }
+        }
+        for &(x, y) in holes.iter().flatten() {
+            mesh.vertices.push([x, y, eave_z]);
+        }
+
+        // ── Walls: one quad (two triangles) per ring edge, with wrap-around ──
+        let mut offset = 0;
+        for &size in &ring_sizes {
+            for i in 0..size {
+                let j = (i + 1) % size;
+                let bc = base_index + offset + i;
+                let bn = base_index + offset + j;
+                let tc = top0 + offset + i;
+                let tn = top0 + offset + j;
+                mesh.triangles.push([bc, bn, tc]);
+                mesh.triangles.push([tc, bn, tn]);
+            }
+            offset += size;
+        }
+
+        // ── Bottom cap (and flat/skillion top cap) via ear clipping ──────────
+        let mut flat_coords: Vec<f64> = Vec::with_capacity(total * 2);
+        for &(x, y) in outer.iter().chain(holes.iter().flatten()) {
+            flat_coords.push(x as f64);
+            flat_coords.push(y as f64);
+        }
+        let mut hole_indices: Vec<usize> = Vec::with_capacity(holes.len());
+        let mut acc = outer.len();
+        for h in holes {
+            hole_indices.push(acc);
+            acc += h.len();
+        }
+        let cap = earcutr::earcut(&flat_coords, &hole_indices, 2)
             .map_err(|e| anyhow::anyhow!("earcut failed: {:?}", e))?;
         if cap.is_empty() {
             anyhow::bail!("degenerate footprint (no triangles produced)");
         }
 
-        let base_index = mesh.vertices.len();
-        for &(x, y) in &footprint {
-            mesh.vertices.push([x, y, base_elevation]);
-        }
-        for &(x, y) in &footprint {
-            mesh.vertices.push([x, y, top_elevation]);
-        }
-        let top0 = base_index + n;
-
-        // Walls: one quad (two triangles) per footprint edge, with wrap-around.
-        for i in 0..n {
-            let j = (i + 1) % n;
-            let bc = base_index + i;
-            let bn = base_index + j;
-            let tc = top0 + i;
-            let tn = top0 + j;
-            mesh.triangles.push([bc, bn, tc]);
-            mesh.triangles.push([tc, bn, tn]);
-        }
-
-        // Caps from the ear-clip result: top CCW (+Z), bottom reversed (−Z).
         for t in cap.chunks_exact(3) {
-            mesh.triangles.push([top0 + t[0], top0 + t[1], top0 + t[2]]);
+            // Bottom cap faces −Z (reversed winding).
             mesh.triangles.push([base_index + t[0], base_index + t[2], base_index + t[1]]);
         }
 
-        Ok(())
+        // ── Roof ─────────────────────────────────────────────────────────────
+        match shape {
+            // A skillion top ring lies on a single tilted plane, so the 2D ear-clip
+            // triangulation lifted to the per-vertex heights is exact.
+            RoofShape::Flat | RoofShape::Skillion => {
+                for t in cap.chunks_exact(3) {
+                    mesh.triangles.push([top0 + t[0], top0 + t[1], top0 + t[2]]);
+                }
+            }
+            RoofShape::Pyramidal => {
+                add_pyramid_roof(mesh, top0, &outer, eave_z + roof_z);
+            }
+            RoofShape::Dome => {
+                add_dome_roof(mesh, top0, &outer, eave_z, roof_z);
+            }
+            RoofShape::Gabled | RoofShape::Hipped => {
+                if outer.len() == 4 {
+                    let inset = if shape == RoofShape::Hipped { 0.3 } else { 0.0 };
+                    add_ridge_roof(mesh, top0, &outer, eave_z + roof_z, inset);
+                } else {
+                    // Non-quad footprint: approximate with a flat-topped hip
+                    // (frustum to an inset copy of the ring) — watertight for any
+                    // simple polygon and reads as a generic pitched roof in print.
+                    add_frustum_roof(mesh, top0, &outer, eave_z + roof_z, &cap);
+                }
+            }
+        }
+
+        Ok(BuildingPlacement {
+            id: building.id,
+            base_elevation,
+            bottom_z,
+            eave_z,
+            top_z,
+            roof_z,
+            vertices_added: mesh.vertices.len() - vertices_at_start,
+            skip_reason: None,
+        })
     }
 
     /// Close the mesh by adding a flat base pedestal, making it watertight for 3D printing.
