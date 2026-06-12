@@ -1,8 +1,11 @@
 use crate::models::{BoundingBox, Building, RoofShape};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 // Community-run Overpass mirrors — tried first (compact out geom response).
 const OVERPASS_ENDPOINTS: &[&str] = &[
@@ -47,6 +50,30 @@ struct FetchStats {
 // the OSM-API 50k-node limit.
 const MAX_TILE_SPLIT_DEPTH: u8 = 2;
 
+// ── Concurrency / time budget ─────────────────────────────────────────────────
+// Tiles are fetched concurrently, bounded by this many in flight (≈2 first
+// attempts per Overpass mirror thanks to per-tile mirror rotation).
+const MAX_CONCURRENT_TILES: usize = 6;
+
+// Within a tile the sources are RACED with staggered starts (hedging): mirror 2
+// joins HEDGE_DELAY after mirror 1, mirror 3 after that, the OSM direct API
+// last. The first success cancels the rest, so a hung mirror costs HEDGE_DELAY
+// instead of a full timeout, and a tile's worst case is
+// ~(3·HEDGE_DELAY + ATTEMPT_TIMEOUT) instead of the serial sum of every
+// fallback timeout (the old N×M blow-up).
+const HEDGE_DELAY: Duration = Duration::from_secs(6);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(25);
+
+// Hard wall-clock budget for the whole building-fetch phase. The frontend
+// aborts the request 120 s after submission (frontend/src/services/api.ts), so
+// this leaves headroom for elevation, meshing and response transfer. When the
+// budget runs out, outstanding tiles fail fast and coverage is reported as
+// PARTIAL instead of blowing the frontend deadline.
+const OSM_PHASE_BUDGET: Duration = Duration::from_secs(90);
+
+// A failed tile is only split-and-retried when at least this much budget is left.
+const MIN_SPLIT_BUDGET: Duration = Duration::from_secs(10);
+
 /// Split a bbox into an `nx` × `ny` grid.
 fn split_bbox_grid(bbox: &BoundingBox, nx: usize, ny: usize) -> Vec<BoundingBox> {
     let dlon = (bbox.max_lon - bbox.min_lon) / nx as f64;
@@ -79,6 +106,58 @@ fn split_bbox(bbox: &BoundingBox, max_km2: f64) -> Vec<BoundingBox> {
     split_bbox_grid(bbox, nx, ny)
 }
 
+/// Stable position of a tile in the fetch grid, surviving split-retries:
+/// `top` is the index in the initial grid, `path` the quadrant taken at each
+/// split depth (0 = not split, else quadrant+1). The derived `Ord` sorts tiles
+/// exactly as the old sequential queue visited them, so merging fetched tiles
+/// in key order reproduces the sequential building order — and therefore the
+/// same dedupe winner for elements spanning tile borders — no matter in which
+/// order the concurrent fetches actually complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TileKey {
+    top: usize,
+    path: [u8; MAX_TILE_SPLIT_DEPTH as usize],
+}
+
+impl TileKey {
+    fn root(top: usize) -> Self {
+        Self { top, path: [0; MAX_TILE_SPLIT_DEPTH as usize] }
+    }
+
+    fn child(mut self, depth: u8, quadrant: usize) -> Self {
+        self.path[(depth - 1) as usize] = quadrant as u8 + 1;
+        self
+    }
+
+    /// Human-readable label, e.g. "3", "3.2", "3.2.4" (1-based).
+    fn label(&self) -> String {
+        let mut s = (self.top + 1).to_string();
+        for &q in self.path.iter().filter(|&&q| q > 0) {
+            s.push('.');
+            s.push_str(&q.to_string());
+        }
+        s
+    }
+}
+
+/// One tile's raw, still-unparsed response plus provenance. Parsing is
+/// deferred to the ordered merge so the shared dedupe set stays sequential.
+struct FetchedTile {
+    source: &'static str,
+    element_count: usize,
+    data: RawTile,
+}
+
+enum RawTile {
+    /// Overpass `out geom` response (inline coordinates).
+    Geom(Value),
+    /// OSM direct API `map.json` response (node-ref format).
+    NodeRefs(Value),
+}
+
+/// What each concurrent tile task hands back to the coordinator.
+type TileTask = (TileKey, u8, BoundingBox, Result<FetchedTile>);
+
 pub struct OsmService {
     client: reqwest::Client,
 }
@@ -102,10 +181,12 @@ impl OsmService {
     ///                                      or outlines split across several ways
     ///                                      (e.g. St Peter's colonnade)
     ///
-    /// Strategy (each step is tried only if the previous one fails):
-    ///   1. Overpass mirrors 1-3 — compact `out geom` query, no recurse step.
-    ///   2. OSM direct API    — `api.openstreetmap.org/api/0.6/map.json`, OSMF-maintained,
-    ///                          much more available than community Overpass instances.
+    /// Strategy: the bbox is split into ≤TILE_MAX_KM2 tiles, ALL fetched
+    /// concurrently (bounded by MAX_CONCURRENT_TILES); within a tile the
+    /// Overpass mirrors and the OSM direct API are raced with staggered starts
+    /// (see HEDGE_DELAY). Raw responses are merged in TileKey order afterwards,
+    /// so the result is byte-identical to a sequential fetch. The whole phase
+    /// runs under OSM_PHASE_BUDGET.
     /// `min_area_m2` is the print-resolution-aware footprint filter computed by
     /// the handler (floored at MIN_BUILDING_AREA_M2 here).
     pub async fn fetch_buildings(&self, bbox: &BoundingBox, min_area_m2: f64) -> Result<Vec<Building>> {
@@ -117,54 +198,101 @@ impl OsmService {
         let min_area_m2 = min_area_m2.max(MIN_BUILDING_AREA_M2);
         tracing::info!("   │  Footprint filter: ≥ {:.0} m² (print-resolution aware)", min_area_m2);
 
-        let request_start = std::time::Instant::now();
+        let request_start = Instant::now();
+        let deadline = request_start + OSM_PHASE_BUDGET;
         let tiles = split_bbox(bbox, TILE_MAX_KM2);
         if tiles.len() > 1 {
-            tracing::info!("   │  Large area: split into {} tiles of ≤ {} km²", tiles.len(), TILE_MAX_KM2);
+            tracing::info!(
+                "   │  Large area: split into {} tiles of ≤ {} km² (≤{} concurrent, {}s budget)",
+                tiles.len(), TILE_MAX_KM2, MAX_CONCURRENT_TILES, OSM_PHASE_BUDGET.as_secs()
+            );
         }
 
+        // ── Concurrent fan-out ────────────────────────────────────────────────
+        // Every tile is an independent task; a failed tile is quartered and its
+        // sub-tiles re-spawned (smaller queries dodge Overpass stalls and the
+        // OSM-API node limit) until MAX_TILE_SPLIT_DEPTH or budget exhaustion.
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TILES));
+        let mut tasks: JoinSet<TileTask> = JoinSet::new();
+        let client = self.client.clone();
+        let mut seq = 0usize; // rotates the starting mirror per spawned tile
+        let mut spawn_tile = |tasks: &mut JoinSet<TileTask>, key: TileKey, depth: u8, tile: BoundingBox| {
+            let client = client.clone();
+            let semaphore = semaphore.clone();
+            let mirror_seq = seq;
+            seq += 1;
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+                let result = fetch_tile_raw(&client, &tile, mirror_seq, deadline).await;
+                (key, depth, tile, result)
+            });
+        };
+        for (i, tile) in tiles.into_iter().enumerate() {
+            spawn_tile(&mut tasks, TileKey::root(i), 0, tile);
+        }
+
+        let mut raw_tiles: Vec<(TileKey, FetchedTile)> = Vec::new();
+        let mut failed_tiles = 0usize;
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((key, depth, tile, result)) = joined else {
+                failed_tiles += 1;
+                tracing::warn!("   │  Tile task aborted unexpectedly");
+                continue;
+            };
+            match result {
+                Ok(fetched) => {
+                    tracing::info!(
+                        "   │  Tile {} (depth {}): ok via {} — {} raw elements ({:.1}s)",
+                        key.label(), depth, fetched.source, fetched.element_count,
+                        request_start.elapsed().as_secs_f64()
+                    );
+                    raw_tiles.push((key, fetched));
+                }
+                Err(e) => {
+                    let time_left = deadline.checked_duration_since(Instant::now());
+                    if depth < MAX_TILE_SPLIT_DEPTH && time_left.is_some_and(|t| t >= MIN_SPLIT_BUDGET) {
+                        tracing::warn!(
+                            "   │  Tile {} (depth {}) failed: {:#} — splitting 2×2 and retrying",
+                            key.label(), depth, e
+                        );
+                        for (q, sub) in split_bbox_grid(&tile, 2, 2).into_iter().enumerate() {
+                            spawn_tile(&mut tasks, key.child(depth + 1, q), depth + 1, sub);
+                        }
+                    } else {
+                        failed_tiles += 1;
+                        tracing::warn!(
+                            "   │  Tile {} (depth {}) FAILED permanently: {:#}",
+                            key.label(), depth, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── Ordered merge ─────────────────────────────────────────────────────
         // Elements spanning tile borders are returned by every tile they touch;
-        // dedupe by (is_relation, id). Geometry is identical in each occurrence
-        // because clipping always uses the FULL request bbox.
-        let mut seen: std::collections::HashSet<(bool, u64)> = std::collections::HashSet::new();
+        // parsing in TileKey order with one shared (is_relation, id) set makes
+        // the dedupe winner deterministic. Geometry is identical in each
+        // occurrence anyway, because clipping always uses the FULL request bbox.
+        raw_tiles.sort_by_key(|(key, _)| *key);
+        let mut seen: HashSet<(bool, u64)> = HashSet::new();
         let mut buildings: Vec<Building> = Vec::new();
         let mut stats = FetchStats::default();
         let mut ok_tiles = 0usize;
-        let mut failed_tiles = 0usize;
-
-        // Work queue: a failed tile is quartered and re-queued (smaller queries
-        // dodge Overpass stalls and the OSM-API node limit) until
-        // MAX_TILE_SPLIT_DEPTH, after which it counts as failed.
-        let mut queue: std::collections::VecDeque<(BoundingBox, u8)> =
-            tiles.into_iter().map(|t| (t, 0u8)).collect();
-        let mut tile_no = 0usize;
-
-        while let Some((tile, depth)) = queue.pop_front() {
-            tile_no += 1;
-            match self
-                .fetch_tile(&tile, bbox, min_area_m2, tile_no, &mut seen, &mut buildings, &mut stats)
-                .await
-            {
-                Ok(source) => {
-                    ok_tiles += 1;
-                    tracing::info!(
-                        "   │  Tile {} (depth {}): ok via {} ({} elements so far, {:.1}s)",
-                        tile_no, depth, source, buildings.len(),
-                        request_start.elapsed().as_secs_f64()
-                    );
+        for (key, fetched) in raw_tiles {
+            let parsed = match fetched.data {
+                RawTile::Geom(v) => {
+                    self.parse_geom_response(v, bbox, min_area_m2, &mut seen, &mut buildings, &mut stats)
                 }
-                Err(e) if depth < MAX_TILE_SPLIT_DEPTH => {
-                    tracing::warn!(
-                        "   │  Tile {} (depth {}) failed: {} — splitting 2×2 and retrying",
-                        tile_no, depth, e
-                    );
-                    for sub in split_bbox_grid(&tile, 2, 2) {
-                        queue.push_back((sub, depth + 1));
-                    }
+                RawTile::NodeRefs(v) => {
+                    self.parse_noderefs_response(v, bbox, min_area_m2, &mut seen, &mut buildings, &mut stats)
                 }
+            };
+            match parsed {
+                Ok(()) => ok_tiles += 1,
                 Err(e) => {
                     failed_tiles += 1;
-                    tracing::warn!("   │  Tile {} (depth {}) FAILED permanently: {}", tile_no, depth, e);
+                    tracing::warn!("   │  Tile {} parse FAILED: {:#}", key.label(), e);
                 }
             }
         }
@@ -182,109 +310,6 @@ impl OsmService {
         let suppressed = suppress_covered_outlines(&mut buildings);
         log_building_stats(&buildings, &stats.src, stats.relations, suppressed, request_start.elapsed());
         Ok(buildings)
-    }
-
-    /// Fetch one tile: Overpass mirrors first, OSM direct API as fallback.
-    /// Parsed buildings are clipped against `clip_bbox` (the full request bbox)
-    /// and appended to `out`. Returns the source that served the tile.
-    async fn fetch_tile(
-        &self,
-        tile: &BoundingBox,
-        clip_bbox: &BoundingBox,
-        min_area_m2: f64,
-        tile_no: usize,
-        seen: &mut std::collections::HashSet<(bool, u64)>,
-        out: &mut Vec<Building>,
-        stats: &mut FetchStats,
-    ) -> Result<&'static str> {
-        // ── Step 1: Overpass mirrors ──────────────────────────────────────────
-        // `out geom qt` returns coordinates inline — ~10× smaller than
-        // `out body;>;out skel qt` because no separate node objects are emitted.
-        // Relations include per-member geometry and roles (outer/inner).
-        let bb = format!(
-            "{},{},{},{}",
-            tile.min_lat, tile.min_lon, tile.max_lat, tile.max_lon
-        );
-        let overpass_query = format!(
-            "[out:json][timeout:30];(\
-             way[\"building\"][\"building\"!=\"no\"]({bb});\
-             way[\"building:part\"][\"building:part\"!=\"no\"]({bb});\
-             relation[\"type\"=\"multipolygon\"][\"building\"][\"building\"!=\"no\"]({bb});\
-             relation[\"type\"=\"multipolygon\"][\"building:part\"][\"building:part\"!=\"no\"]({bb});\
-             );out geom qt;"
-        );
-
-        // Rotate the starting mirror per tile so multi-tile fetches spread load
-        // instead of stalling on the same rate-limited mirror every time.
-        let n_mirrors = OVERPASS_ENDPOINTS.len();
-        for i in 0..n_mirrors {
-            let endpoint = OVERPASS_ENDPOINTS[(tile_no + i) % n_mirrors];
-            tracing::debug!("   │  Overpass attempt {}/{}: {}", i + 1, n_mirrors, endpoint);
-
-            let resp = match self
-                .client
-                .post(endpoint)
-                .form(&[("data", &overpass_query)])
-                .timeout(Duration::from_secs(25))
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("   │  Connection failed: {}", e);
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            match status.as_u16() {
-                200..=299 => {
-                    let data: Value = resp.json().await.context("Failed to parse Overpass JSON")?;
-                    self.parse_geom_response(data, clip_bbox, min_area_m2, seen, out, stats)?;
-                    return Ok("Overpass (out geom)");
-                }
-                429 | 406 => {
-                    tracing::warn!("   │  Rate-limited / rejected — trying next mirror");
-                    continue;
-                }
-                _ => {
-                    let body = resp.text().await.unwrap_or_default();
-                    tracing::warn!("   │  Error {}: {}", status, body.chars().take(120).collect::<String>());
-                    continue;
-                }
-            }
-        }
-
-        // ── Step 2: OSM direct API (fallback) ────────────────────────────────
-        // Returns all OSM elements in the bbox as JSON. More available than
-        // Overpass because it is the primary OSMF-maintained endpoint.
-        // Note: bbox order is west,south,east,north (lon,lat,lon,lat).
-        tracing::info!("   │  All Overpass mirrors failed — falling back to OSM direct API");
-        let url = format!(
-            "https://api.openstreetmap.org/api/0.6/map.json?bbox={},{},{},{}",
-            tile.min_lon, tile.min_lat, tile.max_lon, tile.max_lat
-        );
-
-        let resp = self
-            .client
-            .get(&url)
-            .timeout(Duration::from_secs(25))
-            .send()
-            .await
-            .context("Failed to connect to OSM direct API")?;
-
-        let status = resp.status();
-        if status.as_u16() == 509 {
-            anyhow::bail!("OSM API: tile too dense (> 50 000 nodes)");
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OSM API error {}: {}", status, body.chars().take(200).collect::<String>());
-        }
-
-        let data: Value = resp.json().await.context("Failed to parse OSM API JSON")?;
-        self.parse_noderefs_response(data, clip_bbox, min_area_m2, seen, out, stats)?;
-        Ok("OSM direct API")
     }
 
     // ── Parsers ───────────────────────────────────────────────────────────────
@@ -305,7 +330,7 @@ impl OsmService {
             .as_array()
             .context("Missing 'elements' in Overpass response")?;
 
-        tracing::info!("   │  Received {} OSM elements", elements.len());
+        tracing::debug!("   │  Parsing {} OSM elements", elements.len());
 
         for el in elements.iter() {
             let tags = &el["tags"];
@@ -378,7 +403,7 @@ impl OsmService {
             .as_array()
             .context("Missing 'elements' in OSM API response")?;
 
-        tracing::info!("   │  Received {} total OSM elements", elements.len());
+        tracing::debug!("   │  Parsing {} total OSM elements", elements.len());
 
         // Build node-id → (lon, lat) map
         let mut nodes: HashMap<u64, (f64, f64)> = HashMap::new();
@@ -468,6 +493,162 @@ impl OsmService {
 
         Ok(())
     }
+}
+
+// ── Tile fetching (hedged race) ───────────────────────────────────────────────
+
+/// Fetch one tile's raw OSM data, racing the sources with staggered starts:
+/// Overpass mirror k joins the race k·HEDGE_DELAY in (a healthy first mirror
+/// finishes alone before the second even sends), the OSM direct API joins
+/// last. First success wins — dropping the JoinSet aborts the losers, so late
+/// hedges that never fired cost nothing. `seq` rotates the mirror order per
+/// tile so concurrent tiles spread their first attempts across mirrors.
+async fn fetch_tile_raw(
+    client: &reqwest::Client,
+    tile: &BoundingBox,
+    seq: usize,
+    deadline: Instant,
+) -> Result<FetchedTile> {
+    // `out geom qt` returns coordinates inline — ~10× smaller than
+    // `out body;>;out skel qt` because no separate node objects are emitted.
+    // Relations include per-member geometry and roles (outer/inner).
+    let bb = format!(
+        "{},{},{},{}",
+        tile.min_lat, tile.min_lon, tile.max_lat, tile.max_lon
+    );
+    let overpass_query = format!(
+        "[out:json][timeout:20];(\
+         way[\"building\"][\"building\"!=\"no\"]({bb});\
+         way[\"building:part\"][\"building:part\"!=\"no\"]({bb});\
+         relation[\"type\"=\"multipolygon\"][\"building\"][\"building\"!=\"no\"]({bb});\
+         relation[\"type\"=\"multipolygon\"][\"building:part\"][\"building:part\"!=\"no\"]({bb});\
+         );out geom qt;"
+    );
+
+    let n_mirrors = OVERPASS_ENDPOINTS.len();
+    let mut attempts: JoinSet<Result<FetchedTile>> = JoinSet::new();
+    for k in 0..n_mirrors {
+        let endpoint = OVERPASS_ENDPOINTS[(seq + k) % n_mirrors];
+        attempts.spawn(overpass_attempt(
+            client.clone(),
+            endpoint,
+            overpass_query.clone(),
+            HEDGE_DELAY * k as u32,
+            deadline,
+        ));
+    }
+    attempts.spawn(direct_api_attempt(
+        client.clone(),
+        tile.clone(),
+        HEDGE_DELAY * n_mirrors as u32,
+        deadline,
+    ));
+
+    let mut errors: Vec<String> = Vec::new();
+    while let Some(joined) = attempts.join_next().await {
+        match joined {
+            Ok(Ok(fetched)) => return Ok(fetched),
+            Ok(Err(e)) => errors.push(format!("{e:#}")),
+            Err(e) => errors.push(format!("attempt panicked: {e}")),
+        }
+    }
+    anyhow::bail!("all sources failed: {}", errors.join(" | "))
+}
+
+/// One delayed Overpass request (the delay implements the hedge stagger).
+/// The HTTP timeout is clamped to the remaining phase budget so no attempt
+/// outlives the deadline.
+async fn overpass_attempt(
+    client: reqwest::Client,
+    endpoint: &'static str,
+    query: String,
+    delay: Duration,
+    deadline: Instant,
+) -> Result<FetchedTile> {
+    tokio::time::sleep(delay).await;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("OSM phase budget exhausted")?;
+
+    let resp = client
+        .post(endpoint)
+        .form(&[("data", &query)])
+        .timeout(ATTEMPT_TIMEOUT.min(remaining))
+        .send()
+        .await
+        .with_context(|| format!("{endpoint}: request failed"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        // 429/406 = rate-limited or rejected; anything else is a server error.
+        anyhow::bail!("{}: HTTP {}", endpoint, status);
+    }
+    let data: Value = resp
+        .json()
+        .await
+        .with_context(|| format!("{endpoint}: invalid JSON"))?;
+    // Overpass reports server-side timeout/OOM as 200 + remark + a TRUNCATED
+    // element list — accepting it would silently punch holes in the coverage,
+    // so treat it as a failure (the tile gets hedged elsewhere or split).
+    if let Some(remark) = data["remark"].as_str() {
+        if remark.contains("timed out") || remark.contains("out of memory") {
+            anyhow::bail!("{}: {}", endpoint, remark);
+        }
+    }
+    let element_count = data["elements"]
+        .as_array()
+        .map(|a| a.len())
+        .with_context(|| format!("{endpoint}: missing 'elements'"))?;
+    Ok(FetchedTile {
+        source: endpoint,
+        element_count,
+        data: RawTile::Geom(data),
+    })
+}
+
+/// The OSM direct API as the final hedge: OSMF-maintained and far more
+/// available than community Overpass mirrors, but it returns EVERY element in
+/// the bbox (node-ref format) and rejects tiles above 50 000 nodes.
+/// Note: bbox order is west,south,east,north (lon,lat,lon,lat).
+async fn direct_api_attempt(
+    client: reqwest::Client,
+    tile: BoundingBox,
+    delay: Duration,
+    deadline: Instant,
+) -> Result<FetchedTile> {
+    tokio::time::sleep(delay).await;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("OSM phase budget exhausted")?;
+
+    let url = format!(
+        "https://api.openstreetmap.org/api/0.6/map.json?bbox={},{},{},{}",
+        tile.min_lon, tile.min_lat, tile.max_lon, tile.max_lat
+    );
+    let resp = client
+        .get(&url)
+        .timeout(ATTEMPT_TIMEOUT.min(remaining))
+        .send()
+        .await
+        .context("OSM API: request failed")?;
+
+    let status = resp.status();
+    if status.as_u16() == 509 {
+        anyhow::bail!("OSM API: tile too dense (> 50 000 nodes)");
+    }
+    if !status.is_success() {
+        anyhow::bail!("OSM API: HTTP {}", status);
+    }
+    let data: Value = resp.json().await.context("OSM API: invalid JSON")?;
+    let element_count = data["elements"]
+        .as_array()
+        .map(|a| a.len())
+        .context("OSM API: missing 'elements'")?;
+    Ok(FetchedTile {
+        source: "OSM direct API",
+        element_count,
+        data: RawTile::NodeRefs(data),
+    })
 }
 
 // ── Element construction ──────────────────────────────────────────────────────
