@@ -1,7 +1,11 @@
 use crate::models::{
     BoundingBox, Building, GenerateRequest, GenerateResponse, MeshData, MeshStats, TerrainMesh,
+    WaterFeatures,
 };
+use crate::services::osm::FetchOptions;
+use crate::services::water::{assemble_sea, SeaOutcome};
 use crate::services::{ElevationService, OsmService};
+use crate::utils::hydro::{HydroModel, WATER_RECESS_MM};
 use crate::utils::{
     CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshExporter, MeshGenerator,
 };
@@ -76,6 +80,7 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Vertical scale: {:?}x", request.vertical_scale);
     tracing::info!("   └─ Base height: {:?} mm", request.base_height);
     tracing::info!("   └─ Include buildings: {:?}", request.include_buildings);
+    tracing::info!("   └─ Include water: {:?}", request.include_water);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 1: Validate bounding box area
@@ -104,6 +109,7 @@ pub async fn generate_terrain(
     let vertical_scale = request.vertical_scale.unwrap_or(2.0);
     let base_height = request.base_height.unwrap_or(2.0);
     let include_buildings = request.include_buildings.unwrap_or(true);
+    let include_water = request.include_water.unwrap_or(true);
     // Largest XY dimension of the printed model in mm.
     let print_size_mm = request.print_size.unwrap_or(180.0);
 
@@ -113,6 +119,7 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Base height: {} mm (solid base for 3D printing)", base_height);
     tracing::info!("   └─ Print size: {} mm (largest XY dimension)", print_size_mm);
     tracing::info!("   └─ Include buildings: {}", include_buildings);
+    tracing::info!("   └─ Include water: {}", include_water);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 3: Fetch elevation data from external API
@@ -176,16 +183,26 @@ pub async fn generate_terrain(
         MIN_PRINTED_FOOTPRINT_MM2 / (mm_per_m * mm_per_m)
     };
 
-    let mut buildings = if !include_buildings {
-        tracing::info!("🏢 STEP 4/8: Skipping building data (disabled by user)");
+    // Buildings and water travel in ONE Overpass query per tile.
+    let mut water_features = WaterFeatures::default();
+    let mut buildings = if !include_buildings && !include_water {
+        tracing::info!("🏢 STEP 4/8: Skipping OSM data (buildings and water disabled by user)");
         Vec::new()
     } else {
-        tracing::info!("🏢 STEP 4/8: Fetching building data from OpenStreetMap (Overpass API)");
+        tracing::info!(
+            "🏢 STEP 4/8: Fetching OpenStreetMap data (buildings: {}, water: {})",
+            include_buildings, include_water
+        );
         tracing::info!("   └─ This step makes an HTTP request to Overpass API...");
 
-        match state.osm_service.fetch_buildings(&request.bbox, min_building_area_m2).await {
-            Ok(b) => {
-                if b.is_empty() {
+        let opts = FetchOptions { buildings: include_buildings, water: include_water };
+        match state.osm_service.fetch_features(&request.bbox, opts, min_building_area_m2).await {
+            Ok(f) => {
+                let b = f.buildings;
+                water_features = f.water;
+                if !include_buildings {
+                    // nothing to report
+                } else if b.is_empty() {
                     tracing::info!("   ⚠ No buildings found in this area");
                 } else {
                     let total_height: f32 = b.iter().map(|bld| bld.height).sum();
@@ -197,7 +214,7 @@ pub async fn generate_terrain(
                 b
             }
             Err(e) => {
-                tracing::warn!("   ⚠ Failed to fetch buildings (continuing without): {}", e);
+                tracing::warn!("   ⚠ Failed to fetch OSM data (continuing without buildings/water): {}", e);
                 Vec::new()
             }
         }
@@ -290,7 +307,7 @@ pub async fn generate_terrain(
             ApiError::InternalError(format!("Coordinate projection failed: {}", e))
         })?;
 
-    let projected_points = projector.project_points(&elevation_points)
+    let mut projected_points = projector.project_points(&elevation_points)
         .map_err(|e| {
             tracing::error!("   ✗ FAILED to project elevation points: {}", e);
             ApiError::InternalError(format!("Point projection failed: {}", e))
@@ -316,17 +333,65 @@ pub async fn generate_terrain(
             - y_vals.iter().cloned().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
         (x_range.max(y_range) as f32).max(1.0)
     };
+    // mm per real metre after normalization (matches normalize_to_print_size).
+    let mm_per_m = print_size_mm / xy_range_m;
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 5b: Water — sea from coastlines, hydro-flattening
+    // ═══════════════════════════════════════════════════════════════
+    // Runs BEFORE the relief statistics: water samples are flattened to their
+    // level (sea 0 m, one level per lake, monotone river profiles), so DEM
+    // noise or offshore bathymetry cannot inflate the relief and distort the
+    // scale of the whole scene.
+    let mut hydro: Option<HydroModel> = None;
+    if include_water && !water_features.is_empty() {
+        tracing::info!("─────────────────────────────────────────────────────────────────");
+        tracing::info!("💧 STEP 5b: Water (sea, lakes, rivers) — hydro-flattening");
+        let step_start = std::time::Instant::now();
+        let (sea, sea_status) = match assemble_sea(&water_features.coastlines, &request.bbox, resolution) {
+            SeaOutcome::NoCoastline => (Vec::new(), "no coastline".to_string()),
+            SeaOutcome::Built { polygons, pieces, islands } => {
+                tracing::info!(
+                    "   └─ Sea assembled from coastline: {} polygon(s), {} coastline piece(s), {} island(s)",
+                    polygons.len(), pieces, islands
+                );
+                (polygons, format!("built ({pieces} pieces, {islands} islands)"))
+            }
+            SeaOutcome::Rejected(reason) => {
+                tracing::warn!("   ⚠ Coastline unusable, no sea generated: {}", reason);
+                (Vec::new(), format!("rejected: {reason}"))
+            }
+        };
+        let grid_dim = (resolution + 1) as usize;
+        match HydroModel::build(
+            &water_features,
+            &sea,
+            &sea_status,
+            &projector,
+            &mut projected_points,
+            grid_dim,
+            mm_per_m as f64,
+        ) {
+            Ok(Some(model)) => {
+                tracing::info!("   ✓ {}", model.summary());
+                hydro = Some(model);
+            }
+            Ok(None) => tracing::info!("   ⚠ No printable water inside the area"),
+            Err(e) => tracing::warn!("   ⚠ Water modelling failed (continuing without water): {:#}", e),
+        }
+        tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
     // Robust relief (p1–p99): single DEM pits/spikes (Modena has an 8 m
     // outlier pit) must not decide the exaggeration of the whole scene.
+    // Measured on the projected grid, i.e. AFTER hydro-flattening.
     let elevation_range = {
-        let mut z: Vec<f32> = elevation_points.iter().map(|p| p.elevation).collect();
+        let mut z: Vec<f32> = projected_points.iter().map(|p| p.z).collect();
         z.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let q = |p: f32| z[((z.len() - 1) as f32 * p).round() as usize];
         (q(0.99) - q(0.01)).max(1.0_f32)
     };
 
-    // mm per real metre after normalization (matches normalize_to_print_size).
-    let mm_per_m = print_size_mm / xy_range_m;
     let relief_m = elevation_range; // already clamped to ≥ 1.0 above
 
     const MAX_TERRAIN_FRAC: f32 = 0.28; // terrain relief never exceeds this × print size
@@ -414,14 +479,19 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Using Delaunay triangulation to create triangle mesh from elevation points");
     let step_start = std::time::Instant::now();
 
+    // Water surfaces sit a fixed PRINTED depth below their shore.
+    let water_recess_z = WATER_RECESS_MM / mm_per_m;
+
     let mesh_generator = MeshGenerator::new(
         projector,
         effective_terrain_scale,
         effective_building_scale,
         min_building_z,
+        water_recess_z,
         base_height,
     );
-    let mut mesh = mesh_generator.generate_terrain_mesh(&projected_points)
+    let (mut mesh, water_triangle_count) = mesh_generator
+        .generate_terrain_mesh(&projected_points, hydro.as_ref())
         .map_err(|e| {
             tracing::error!("   ✗ FAILED to generate terrain mesh: {}", e);
             ApiError::InternalError(format!("Mesh generation failed: {}", e))
@@ -429,7 +499,8 @@ pub async fn generate_terrain(
 
     // Record terrain vertex/triangle counts before buildings are added.
     // terrain_vertex_count lets add_buildings sample the ground elevation beneath each footprint.
-    // terrain_triangle_count is sent to the frontend so it can colour terrain and buildings separately.
+    // terrain_triangle_count is sent to the frontend so it can colour terrain and buildings separately
+    // (its last water_triangle_count triangles are the water surface).
     let terrain_vertex_count = mesh.vertices.len();
     let terrain_triangle_count = mesh.triangles.len();
     tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
@@ -524,6 +595,8 @@ pub async fn generate_terrain(
         &request.bbox,
         &buildings,
         inference_report.as_ref(),
+        hydro.as_ref(),
+        water_triangle_count,
         &placements,
         &mesh,
         terrain_triangle_count,
@@ -548,6 +621,7 @@ pub async fn generate_terrain(
         min_elevation: elev_min,
         max_elevation: elev_max,
         buildings_count: buildings.len(),
+        water_features_count: hydro.as_ref().map_or(0, |h| h.features_used),
     };
 
     // Prepare mesh data for frontend rendering.
@@ -558,6 +632,7 @@ pub async fn generate_terrain(
         triangles: mesh.triangles.clone(),
         terrain_triangle_count,
         building_triangle_count,
+        water_triangle_count,
     };
 
     let total_elapsed = total_start.elapsed();
@@ -569,6 +644,7 @@ pub async fn generate_terrain(
     tracing::info!("   ├─ Total vertices:     {}", stats.vertices);
     tracing::info!("   ├─ Total triangles:    {}", stats.triangles);
     tracing::info!("   ├─ Buildings included: {}", stats.buildings_count);
+    tracing::info!("   ├─ Water features:     {} ({} water triangles)", stats.water_features_count, water_triangle_count);
     tracing::info!("   ├─ Area covered:       {:.4} km²", stats.area_km2);
     tracing::info!("   ├─ Elevation range:    {:.1}m to {:.1}m", stats.min_elevation, stats.max_elevation);
     tracing::info!("   └─ Mesh watertight:    {}", if is_manifold { "Yes ✓" } else { "No ⚠" });
@@ -586,10 +662,13 @@ pub async fn generate_terrain(
 /// Write a per-generation geometry report to `logs/last_geometry.json` so the
 /// building geometry can be evaluated without a 3D viewer: roof-shape histogram,
 /// building:part / courtyard counts, the tallest elements, and mesh integrity.
+#[allow(clippy::too_many_arguments)]
 fn write_geometry_report(
     bbox: &BoundingBox,
     buildings: &[Building],
     inference: Option<&crate::services::height_inference::InferenceReport>,
+    hydro: Option<&HydroModel>,
+    water_triangles: usize,
     placements: &[crate::utils::mesh::BuildingPlacement],
     mesh: &TerrainMesh,
     terrain_triangles: usize,
@@ -657,10 +736,12 @@ fn write_geometry_report(
                 })),
             })),
         },
+        "water": hydro.map(|h| h.report.clone()),
         "mesh": {
             "vertices": mesh.vertices.len(),
             "triangles": mesh.triangles.len(),
             "terrain_triangles": terrain_triangles,
+            "water_triangles": water_triangles,
             "building_triangles": building_triangles,
             "manifold": is_manifold,
         },

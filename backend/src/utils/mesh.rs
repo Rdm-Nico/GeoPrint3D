@@ -1,6 +1,23 @@
 use crate::models::{Building, ProjectedPoint, RoofShape, TerrainMesh};
+use crate::utils::hydro::HydroModel;
 use crate::utils::projection::CoordinateProjector;
 use anyhow::Result;
+use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
+
+/// Vertex of the constrained terrain triangulation. `grid` is the index of the
+/// DEM grid point it came from; shoreline / split vertices have none.
+#[derive(Clone, Copy, Debug)]
+struct CdtVertex {
+    pos: Point2<f64>,
+    grid: Option<u32>,
+}
+
+impl HasPosition for CdtVertex {
+    type Scalar = f64;
+    fn position(&self) -> Point2<f64> {
+        self.pos
+    }
+}
 
 /// Signed area (shoelace) of a 2D polygon ring; positive ⇒ counter-clockwise.
 fn signed_area(pts: &[(f32, f32)]) -> f32 {
@@ -255,8 +272,9 @@ fn add_frustum_roof(
 
 /// Coarse uniform-grid spatial index over terrain vertices for fast nearest-Z
 /// lookups. Used to anchor building bases to the ground beneath their footprint
-/// (O(1) amortised per query vs an O(n) scan of every terrain vertex).
-struct TerrainIndex {
+/// (O(1) amortised per query vs an O(n) scan of every terrain vertex), and by
+/// `utils::hydro` to sample the DEM and look up river-profile stations.
+pub(crate) struct TerrainIndex {
     verts: Vec<[f32; 3]>,
     inv_cell: f32,
     min_x: f32,
@@ -265,7 +283,7 @@ struct TerrainIndex {
 }
 
 impl TerrainIndex {
-    fn build(verts: Vec<[f32; 3]>) -> Self {
+    pub(crate) fn build(verts: Vec<[f32; 3]>) -> Self {
         let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
         let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
         for v in &verts {
@@ -289,14 +307,20 @@ impl TerrainIndex {
     }
 
     /// Nearest terrain Z to (x, y), searching outward in grid rings.
-    fn nearest_z(&self, x: f32, y: f32) -> Option<f32> {
+    pub(crate) fn nearest_z(&self, x: f32, y: f32) -> Option<f32> {
+        self.nearest_index(x, y).map(|i| self.verts[i][2])
+    }
+
+    /// Index (into the vertices the index was built from) of the vertex
+    /// nearest to (x, y), searching outward in grid rings.
+    pub(crate) fn nearest_index(&self, x: f32, y: f32) -> Option<usize> {
         if self.verts.is_empty() {
             return None;
         }
         let cx = ((x - self.min_x) * self.inv_cell) as i32;
         let cy = ((y - self.min_y) * self.inv_cell) as i32;
         let mut best_d = f32::MAX;
-        let mut best_z = None;
+        let mut best = None;
         for r in 0..8 {
             for gx in (cx - r)..=(cx + r) {
                 for gy in (cy - r)..=(cy + r) {
@@ -310,18 +334,18 @@ impl TerrainIndex {
                             let d = (v[0] - x).powi(2) + (v[1] - y).powi(2);
                             if d < best_d {
                                 best_d = d;
-                                best_z = Some(v[2]);
+                                best = Some(id as usize);
                             }
                         }
                     }
                 }
             }
             // One extra ring past the first hit guarantees the true nearest.
-            if best_z.is_some() && r >= 1 {
+            if best.is_some() && r >= 1 {
                 break;
             }
         }
-        best_z
+        best
     }
 }
 
@@ -337,6 +361,8 @@ pub struct MeshGenerator {
     /// Smallest wall height (mesh Z units) of a ground-level building outline,
     /// so tiny structures don't vanish into the terrain on large-area prints.
     min_building_height: f32,
+    /// Depth (mesh Z units) of water surfaces below their shore.
+    water_recess: f32,
     base_height: f32,
 }
 
@@ -346,6 +372,7 @@ impl MeshGenerator {
         terrain_scale: f32,
         building_scale: f32,
         min_building_height: f32,
+        water_recess: f32,
         base_height: f32,
     ) -> Self {
         Self {
@@ -353,12 +380,200 @@ impl MeshGenerator {
             terrain_scale,
             building_scale,
             min_building_height,
+            water_recess,
             base_height,
         }
     }
 
+    /// Generate the terrain surface. Without water this is the plain Delaunay
+    /// triangulation of the DEM grid; with water the shorelines become
+    /// constraint edges (see `generate_terrain_with_water`).
+    /// Returns the mesh and the number of trailing water-surface triangles.
+    pub fn generate_terrain_mesh(
+        &self,
+        points: &[ProjectedPoint],
+        hydro: Option<&HydroModel>,
+    ) -> Result<(TerrainMesh, usize)> {
+        match hydro {
+            Some(h) => self.generate_terrain_with_water(points, h),
+            None => Ok((self.generate_plain_terrain(points)?, 0)),
+        }
+    }
+
+    /// Terrain with vector-accurate water (constrained Delaunay, spade).
+    ///
+    /// The DEM grid points are triangulated together with the shorelines of
+    /// the water region W as CONSTRAINT edges, so no triangle straddles a
+    /// shore and every triangle is either land or water (classified by its
+    /// centroid). Shore vertices are duplicated: a land copy at the water
+    /// level (the shore IS the waterline, like a hydro-flattening breakline)
+    /// and a water copy `water_recess` lower; a vertical wall strip joins the
+    /// two along every land/water edge, so the surface stays a single closed
+    /// 2-manifold with a printable step at the waterline. Output order:
+    /// land triangles, shore walls, then water triangles (counted last).
+    fn generate_terrain_with_water(&self, points: &[ProjectedPoint], hydro: &HydroModel) -> Result<(TerrainMesh, usize)> {
+        tracing::info!("   ┌─ Mesh Generator: Terrain Surface with water");
+        tracing::info!("   │  Algorithm: Constrained Delaunay (shorelines as constraint edges)");
+        anyhow::ensure!(!points.is_empty(), "No elevation points provided");
+
+        let z_min = points.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+        let ts = self.terrain_scale;
+
+        // ── Triangulate grid + shoreline constraints ─────────────────────────
+        let grid: Vec<CdtVertex> = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| CdtVertex { pos: Point2::new(p.x, p.y), grid: Some(i as u32) })
+            .collect();
+        let mut cdt: ConstrainedDelaunayTriangulation<CdtVertex> = ConstrainedDelaunayTriangulation::bulk_load(grid)
+            .map_err(|e| anyhow::anyhow!("triangulation failed: {e:?}"))?;
+        let mut constraints = 0usize;
+        for poly in &hydro.water.0 {
+            for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
+                let mut handles = Vec::with_capacity(ring.0.len());
+                for c in &ring.0 {
+                    let p = Point2::new(c.x, c.y);
+                    let h = match cdt.locate_vertex(p) {
+                        Some(v) => v.fix(),
+                        None => cdt
+                            .insert(CdtVertex { pos: p, grid: None })
+                            .map_err(|e| anyhow::anyhow!("shore vertex insertion failed: {e:?}"))?,
+                    };
+                    handles.push(h);
+                }
+                for w in handles.windows(2) {
+                    if w[0] != w[1] {
+                        constraints += cdt
+                            .add_constraint_and_split(w[0], w[1], |pos| CdtVertex { pos, grid: None })
+                            .len();
+                    }
+                }
+            }
+        }
+
+        // ── Classify faces and find shore vertices ───────────────────────────
+        let nv = cdt.num_vertices();
+        let mut face_water = vec![false; cdt.num_all_faces()];
+        let mut has_land = vec![false; nv];
+        let mut has_water = vec![false; nv];
+        for face in cdt.inner_faces() {
+            let [a, b, c] = face.positions();
+            let w = hydro.is_water((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0);
+            face_water[face.fix().index()] = w;
+            for v in face.vertices() {
+                if w {
+                    has_water[v.fix().index()] = true;
+                } else {
+                    has_land[v.fix().index()] = true;
+                }
+            }
+        }
+
+        // ── Vertex heights (mesh units, pre-normalisation) ───────────────────
+        // Land: DEM (grid points) — except shore vertices, which sit at the
+        // water level. Water: level − recess.
+        let mut land_z = vec![0.0f32; nv];
+        let mut water_z = vec![0.0f32; nv];
+        for v in cdt.vertices() {
+            let i = v.fix().index();
+            let p = v.position();
+            if has_water[i] {
+                let level = hydro.level_at(p.x, p.y);
+                water_z[i] = (level - z_min) * ts - self.water_recess;
+                land_z[i] = (level - z_min) * ts;
+            } else {
+                let z = match v.data().grid {
+                    Some(g) => points[g as usize].z,
+                    None => hydro.ground_z(p.x, p.y).unwrap_or(z_min),
+                };
+                land_z[i] = (z - z_min) * ts;
+            }
+        }
+        // Bank clamp: land next to the shore never dips below the waterline,
+        // otherwise the bank would read as a pit lower than the water itself.
+        let mut clamped = 0usize;
+        for face in cdt.inner_faces() {
+            if face_water[face.fix().index()] {
+                continue;
+            }
+            let ids = face.vertices().map(|v| v.fix().index());
+            let shore_max = ids.iter().filter(|&&i| has_water[i]).map(|&i| land_z[i]).fold(f32::NEG_INFINITY, f32::max);
+            if shore_max.is_finite() {
+                for &i in &ids {
+                    if !has_water[i] && land_z[i] < shore_max {
+                        land_z[i] = shore_max;
+                        clamped += 1;
+                    }
+                }
+            }
+        }
+
+        // ── Emit vertices: one copy per side a vertex touches ────────────────
+        let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(nv + nv / 8);
+        let mut land_idx = vec![usize::MAX; nv];
+        let mut water_idx = vec![usize::MAX; nv];
+        for v in cdt.vertices() {
+            let i = v.fix().index();
+            let p = v.position();
+            if has_land[i] {
+                land_idx[i] = vertices.len();
+                vertices.push([p.x as f32, p.y as f32, land_z[i]]);
+            }
+            if has_water[i] {
+                water_idx[i] = vertices.len();
+                vertices.push([p.x as f32, p.y as f32, water_z[i]]);
+            }
+        }
+
+        // ── Emit triangles: land, shore walls, water ─────────────────────────
+        let mut land_tris: Vec<[usize; 3]> = Vec::new();
+        let mut walls: Vec<[usize; 3]> = Vec::new();
+        let mut water_tris: Vec<[usize; 3]> = Vec::new();
+        for face in cdt.inner_faces() {
+            let w = face_water[face.fix().index()];
+            let map = if w { &water_idx } else { &land_idx };
+            let [a, b, c] = face.vertices().map(|v| map[v.fix().index()]);
+            if w {
+                water_tris.push([a, b, c]);
+                continue;
+            }
+            land_tris.push([a, b, c]);
+            // Every land/water edge (constraint or not — classification is
+            // the single source of truth) gets a wall facing the water.
+            for e in face.adjacent_edges() {
+                let Some(other) = e.rev().face().as_inner() else { continue };
+                if !face_water[other.fix().index()] {
+                    continue;
+                }
+                let (from, to) = (e.from().fix().index(), e.to().fix().index());
+                let (al, bl, aw, bw) = (land_idx[from], land_idx[to], water_idx[from], water_idx[to]);
+                walls.push([bl, al, aw]);
+                walls.push([bl, aw, bw]);
+            }
+        }
+
+        let water_tc = water_tris.len();
+        let mut triangles = land_tris;
+        let n_land = triangles.len();
+        let n_walls = walls.len();
+        triangles.extend(walls);
+        triangles.extend(water_tris);
+
+        tracing::info!("   │  Grid points: {}, shoreline constraint edges: {}", points.len(), constraints);
+        tracing::info!("   │  ✓ Terrain mesh generated:");
+        tracing::info!("   │    ├─ Vertices:  {}", vertices.len());
+        tracing::info!(
+            "   │    ├─ Triangles: {} land + {} shore wall + {} water",
+            n_land, n_walls, water_tc
+        );
+        tracing::info!("   │    └─ Bank clamp raised {} land vertex(es) to the waterline", clamped);
+        tracing::info!("   └─ Water recess: {:.3} mesh units below the shore", self.water_recess);
+
+        Ok((TerrainMesh { vertices, triangles }, water_tc))
+    }
+
     /// Generate terrain mesh from elevation points using Delaunay triangulation
-    pub fn generate_terrain_mesh(&self, points: &[ProjectedPoint]) -> Result<TerrainMesh> {
+    fn generate_plain_terrain(&self, points: &[ProjectedPoint]) -> Result<TerrainMesh> {
         tracing::info!("   ┌─ Mesh Generator: Terrain Surface");
         tracing::info!("   │  Algorithm: Delaunay Triangulation");
         tracing::info!("   │  Input: {} elevation points", points.len());
@@ -403,12 +618,15 @@ impl MeshGenerator {
             ]);
         }
 
+        // delaunator emits clockwise triangles; flip them to counter-clockwise
+        // (normal up) like the building caps and the water path, so the closed
+        // solid's normals point outward instead of inside-out.
         let mut triangles = Vec::new();
         for i in (0..triangulation.triangles.len()).step_by(3) {
             triangles.push([
                 triangulation.triangles[i],
-                triangulation.triangles[i + 1],
                 triangulation.triangles[i + 2],
+                triangulation.triangles[i + 1],
             ]);
         }
 
@@ -955,5 +1173,313 @@ impl MeshGenerator {
         }
 
         Ok(is_manifold)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{BoundingBox, ElevationPoint, WaterArea, WaterFeatures, WaterKind, Waterway};
+    use crate::services::water::{assemble_sea, SeaOutcome};
+
+    const RES: u32 = 40;
+
+    fn bbox() -> BoundingBox {
+        // ~1.1 km × 1.2 km near Bologna.
+        BoundingBox { min_lat: 44.49, min_lon: 11.33, max_lat: 44.50, max_lon: 11.345 }
+    }
+
+    fn rect(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> Vec<(f64, f64)> {
+        vec![(lon0, lat0), (lon1, lat0), (lon1, lat1), (lon0, lat1)]
+    }
+
+    /// Project a synthetic DEM, build the water model, triangulate, close and
+    /// validate. Returns (mesh before base closure, water_tc, hydro, z_min).
+    fn build(
+        features: &WaterFeatures,
+        sea: &[WaterArea],
+        z: impl Fn(f64, f64) -> f32,
+    ) -> (TerrainMesh, usize, HydroModel, bool, f32) {
+        let b = bbox();
+        let mut elev = Vec::new();
+        for i in 0..=RES {
+            for j in 0..=RES {
+                let lat = b.min_lat + i as f64 * (b.max_lat - b.min_lat) / RES as f64;
+                let lon = b.min_lon + j as f64 * (b.max_lon - b.min_lon) / RES as f64;
+                elev.push(ElevationPoint { lat, lon, elevation: z(lon, lat) });
+            }
+        }
+        let projector = CoordinateProjector::new(&b).unwrap();
+        let mut points = projector.project_points(&elev).unwrap();
+        let xs = points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max)
+            - points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+        let mm_per_m = 180.0 / xs;
+        let hydro = HydroModel::build(features, sea, "test", &projector, &mut points, (RES + 1) as usize, mm_per_m)
+            .unwrap()
+            .expect("water expected");
+        let z_min = points.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+        let generator = MeshGenerator::new(projector, 1.0, 1.0, 0.0, 0.6 / mm_per_m as f32, 2.0);
+        let (mesh, water_tc) = generator.generate_terrain_mesh(&points, Some(&hydro)).unwrap();
+        let mut closed = TerrainMesh { vertices: mesh.vertices.clone(), triangles: mesh.triangles.clone() };
+        generator.close_mesh_with_base(&mut closed).unwrap();
+        let manifold = generator.validate_manifold(&closed).unwrap();
+        (mesh, water_tc, hydro, manifold, z_min)
+    }
+
+    fn signed_area_xy(m: &TerrainMesh, t: &[usize; 3]) -> f32 {
+        let [a, b, c] = t.map(|i| m.vertices[i]);
+        ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) * 0.5
+    }
+
+    fn lake(outer: Vec<(f64, f64)>) -> WaterFeatures {
+        WaterFeatures {
+            areas: vec![WaterArea { id: 1, kind: WaterKind::Lake, outer, holes: Vec::new() }],
+            ..Default::default()
+        }
+    }
+
+    // Gentle deterministic DEM noise around 50 m.
+    fn noisy(lon: f64, lat: f64) -> f32 {
+        50.0 + ((lon * 7919.0).sin() * (lat * 6271.0).cos()) as f32 * 0.8
+    }
+
+    #[test]
+    fn lake_in_the_middle_is_flat_recessed_and_watertight() {
+        let (mesh, water_tc, hydro, manifold, z_min) = build(&lake(rect(11.336, 44.493, 11.339, 44.497)), &[], noisy);
+        assert!(manifold, "terrain + lake + base must be a closed 2-manifold");
+        assert!(water_tc > 0);
+        let n = mesh.triangles.len();
+        let water = &mesh.triangles[n - water_tc..];
+        let zs: Vec<f32> = water.iter().flatten().map(|&i| mesh.vertices[i][2]).collect();
+        let (lo, hi) = zs.iter().fold((f32::MAX, f32::MIN), |(l, h), &z| (l.min(z), h.max(z)));
+        assert!(hi - lo < 1e-4, "a lake is ONE level ({lo}..{hi})");
+        // Level comes from the shoreline (DEM 49.2–50.8), recessed below it.
+        let level = hydro.level_at(0.0, 0.0);
+        assert!((49.0..51.0).contains(&level), "level {level}");
+        assert!(lo < (level - z_min) - 1e-3, "water surface sits below its shore");
+        // Everything faces up (CCW seen from above), like the building caps
+        // (shore walls are vertical: zero XY area). f32 rounding may flip a
+        // sub-mm² sliver, nothing larger.
+        for t in mesh.triangles[..n - water_tc].iter().chain(water) {
+            let a = signed_area_xy(&mesh, t);
+            assert!(a >= -1e-2, "downward-facing triangle (area {a} m²)");
+        }
+    }
+
+    #[test]
+    fn lake_cut_by_the_bbox_edge_stays_watertight() {
+        // Extends ~400 m past the eastern edge.
+        let (_, water_tc, _, manifold, _) = build(&lake(rect(11.341, 44.493, 11.35, 44.497)), &[], noisy);
+        assert!(water_tc > 0);
+        assert!(manifold);
+    }
+
+    #[test]
+    fn plain_terrain_faces_up_too() {
+        let b = bbox();
+        let projector = CoordinateProjector::new(&b).unwrap();
+        let elev: Vec<ElevationPoint> = (0..=10)
+            .flat_map(|i| (0..=10).map(move |j| (i, j)))
+            .map(|(i, j)| ElevationPoint {
+                lat: b.min_lat + i as f64 * 0.001,
+                lon: b.min_lon + j as f64 * 0.0015,
+                elevation: 10.0,
+            })
+            .collect();
+        let points = projector.project_points(&elev).unwrap();
+        let generator = MeshGenerator::new(projector, 1.0, 1.0, 0.0, 0.0, 2.0);
+        let (mesh, water_tc) = generator.generate_terrain_mesh(&points, None).unwrap();
+        assert_eq!(water_tc, 0);
+        // f32 rounding can flip a hull sliver; real triangles all face up.
+        let down = mesh.triangles.iter().filter(|t| signed_area_xy(&mesh, t) < -1e-2).count();
+        assert_eq!(down, 0, "delaunator path orientation");
+    }
+
+    #[test]
+    fn sea_from_coastline_ignores_bathymetry() {
+        // Coastline running west → east through the middle: land north, sea
+        // south. The DEM carries 30 m deep bathymetry offshore.
+        let b = bbox();
+        let mid = (b.min_lat + b.max_lat) / 2.0;
+        let features = WaterFeatures {
+            coastlines: vec![(7, vec![(11.32, mid), (11.35, mid)])],
+            ..Default::default()
+        };
+        let sea = match assemble_sea(&features.coastlines, &b, RES) {
+            SeaOutcome::Built { polygons, .. } => polygons,
+            other => panic!("{other:?}"),
+        };
+        let (mesh, water_tc, hydro, manifold, z_min) =
+            build(&features, &sea, |_, lat| if lat < mid { -30.0 } else { 4.0 });
+        assert!(manifold);
+        assert!(water_tc > 0);
+        assert!(z_min >= -1e-6, "bathymetry must be flattened to sea level (z_min {z_min})");
+        assert_eq!(hydro.level_at(0.0, -300.0), 0.0);
+        let n = mesh.triangles.len();
+        assert!(mesh.triangles[n - water_tc..].iter().flatten().all(|&i| mesh.vertices[i][2] < 0.0));
+    }
+
+    #[test]
+    fn river_profile_never_runs_uphill() {
+        // River flowing east on a valley floor sloping 50 → 40 m, with a
+        // 6 m "bridge" bump in the DEM halfway.
+        let b = bbox();
+        let mid = (b.min_lat + b.max_lat) / 2.0;
+        let features = WaterFeatures {
+            waterways: vec![Waterway {
+                id: 3,
+                kind: WaterKind::River,
+                line: vec![(11.325, mid), (11.3375, mid), (11.35, mid)],
+                width_m: 40.0,
+            }],
+            ..Default::default()
+        };
+        let z = |lon: f64, _lat: f64| {
+            let t = ((lon - 11.33) / 0.015) as f32;
+            let bridge = if (lon - 11.3375).abs() < 0.0006 { 6.0 } else { 0.0 };
+            50.0 - 10.0 * t + bridge
+        };
+        let (_, water_tc, hydro, manifold, _) = build(&features, &[], z);
+        assert!(manifold);
+        assert!(water_tc > 0);
+        // Sample the surface along the centreline, west → east.
+        let projector = CoordinateProjector::new(&b).unwrap();
+        let levels: Vec<f32> = (0..=20)
+            .map(|k| {
+                let lon = 11.331 + k as f64 * 0.013 / 20.0;
+                let p = projector.project(lon, mid, 0.0).unwrap();
+                hydro.level_at(p.x, p.y)
+            })
+            .collect();
+        assert!(levels.windows(2).all(|w| w[0] >= w[1] - 1e-4), "uphill water: {levels:?}");
+        assert!(levels[0] - levels[20] > 5.0, "profile keeps the valley slope: {levels:?}");
+        assert!(levels.iter().all(|&l| l < 51.0), "bridge bump leaked into the profile: {levels:?}");
+    }
+
+    #[test]
+    fn connected_canals_share_one_level() {
+        // A T of two canals; the DEM along the eastern branch is polluted by
+        // buildings (8 m) while the rest sits at 2 m.
+        let b = bbox();
+        let mid = (b.min_lat + b.max_lat) / 2.0;
+        let canal = |id, line| Waterway { id, kind: WaterKind::Canal, line, width_m: 20.0 };
+        let features = WaterFeatures {
+            waterways: vec![
+                canal(1, vec![(11.325, mid), (11.3375, mid)]),
+                canal(2, vec![(11.3375, mid), (11.35, mid)]),
+                canal(3, vec![(11.3375, 44.505), (11.3375, mid)]),
+            ],
+            ..Default::default()
+        };
+        let (_, _, hydro, manifold, _) = build(&features, &[], |lon, _| if lon > 11.339 { 8.0 } else { 2.0 });
+        assert!(manifold);
+        let projector = CoordinateProjector::new(&b).unwrap();
+        let at = |lon: f64, lat: f64| {
+            let p = projector.project(lon, lat, 0.0).unwrap();
+            hydro.level_at(p.x, p.y)
+        };
+        let (west, east, north) = (at(11.332, mid), at(11.343, mid), at(11.3375, 44.498));
+        assert!((west - east).abs() < 1e-4 && (west - north).abs() < 1e-4, "{west} {east} {north}");
+        assert!(west < 5.0, "network level must not follow the polluted branch: {west}");
+    }
+
+    #[test]
+    fn basin_open_to_the_sea_is_at_sea_level() {
+        let b = bbox();
+        let mid = (b.min_lat + b.max_lat) / 2.0;
+        let mut features = WaterFeatures {
+            coastlines: vec![(7, vec![(11.32, mid), (11.35, mid)])],
+            ..Default::default()
+        };
+        // A harbour basin straddling the coastline, quays at 6 m.
+        features.areas.push(WaterArea {
+            id: 9,
+            kind: WaterKind::Lake,
+            outer: rect(11.336, mid - 0.001, 11.339, mid + 0.002),
+            holes: Vec::new(),
+        });
+        let sea = match assemble_sea(&features.coastlines, &b, RES) {
+            SeaOutcome::Built { polygons, .. } => polygons,
+            other => panic!("{other:?}"),
+        };
+        let (_, _, hydro, manifold, _) = build(&features, &sea, |_, lat| if lat < mid { -10.0 } else { 6.0 });
+        assert!(manifold);
+        let projector = CoordinateProjector::new(&b).unwrap();
+        let p = projector.project(11.3375, mid + 0.0015, 0.0).unwrap();
+        assert_eq!(hydro.level_at(p.x, p.y), 0.0, "inner part of the basin");
+    }
+
+    #[test]
+    fn tributary_buffer_does_not_raise_the_main_river() {
+        // A river area (with its centreline) at ~40 m, and a hillside stream
+        // at ~55 m whose buffered mouth overlaps the river area.
+        let b = bbox();
+        let mid = (b.min_lat + b.max_lat) / 2.0;
+        let features = WaterFeatures {
+            areas: vec![WaterArea {
+                id: 1,
+                kind: WaterKind::River,
+                outer: rect(11.325, mid - 0.0006, 11.35, mid + 0.0006),
+                holes: Vec::new(),
+            }],
+            waterways: vec![
+                Waterway { id: 2, kind: WaterKind::River, line: vec![(11.325, mid), (11.35, mid)], width_m: 100.0 },
+                Waterway {
+                    id: 3,
+                    kind: WaterKind::Stream,
+                    line: vec![(11.3375, 44.4995), (11.3375, mid)],
+                    width_m: 30.0,
+                },
+            ],
+            ..Default::default()
+        };
+        let (_, _, hydro, manifold, _) =
+            build(&features, &[], |_, lat| if (lat - mid).abs() < 0.0007 { 40.0 } else { 55.0 });
+        assert!(manifold);
+        let projector = CoordinateProjector::new(&b).unwrap();
+        // Inside the river area, right where the stream's buffer overlaps it.
+        let p = projector.project(11.3375, mid + 0.0004, 0.0).unwrap();
+        let l = hydro.level_at(p.x, p.y);
+        assert!(l < 42.0, "river level polluted by the tributary: {l}");
+    }
+
+    #[test]
+    fn short_stretch_on_a_bridge_does_not_own_the_river() {
+        // A river area with its centreline at ~40 m, and a short "stream"
+        // mapped across it right where a bridge deck (52 m) sits in the DEM.
+        let b = bbox();
+        let mid = (b.min_lat + b.max_lat) / 2.0;
+        let features = WaterFeatures {
+            areas: vec![WaterArea {
+                id: 1,
+                kind: WaterKind::River,
+                outer: rect(11.325, mid - 0.0008, 11.35, mid + 0.0008),
+                holes: Vec::new(),
+            }],
+            waterways: vec![
+                Waterway { id: 2, kind: WaterKind::River, line: vec![(11.325, mid), (11.35, mid)], width_m: 100.0 },
+                Waterway {
+                    id: 3,
+                    kind: WaterKind::Stream,
+                    line: vec![(11.3375, mid - 0.0005), (11.3375, mid + 0.0005)],
+                    width_m: 10.0,
+                },
+            ],
+            ..Default::default()
+        };
+        let (_, _, hydro, manifold, _) = build(&features, &[], |lon, lat| {
+            if (lat - mid).abs() >= 0.0009 {
+                55.0
+            } else if (lon - 11.3375).abs() < 0.0003 {
+                52.0 // bridge deck
+            } else {
+                40.0
+            }
+        });
+        assert!(manifold);
+        let projector = CoordinateProjector::new(&b).unwrap();
+        let p = projector.project(11.3376, mid + 0.0003, 0.0).unwrap();
+        let l = hydro.level_at(p.x, p.y);
+        assert!(l < 42.0, "bridge stretch leaked into the river level: {l}");
     }
 }

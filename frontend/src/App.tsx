@@ -31,6 +31,7 @@ export default function App() {
   const [baseHeight, setBaseHeight] = useState(2.0);
   const [printSize, setPrintSize] = useState(180);
   const [includeBuildings, setIncludeBuildings] = useState(true);
+  const [includeWater, setIncludeWater] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
 
   const handleGenerate = async () => {
@@ -50,6 +51,7 @@ export default function App() {
         vertical_scale: verticalScale,
         base_height: baseHeight,
         include_buildings: includeBuildings,
+        include_water: includeWater,
         print_size: printSize,
       });
 
@@ -174,6 +176,18 @@ export default function App() {
                     Include Buildings
                   </label>
                 </div>
+
+                <div className="flex items-center">
+                  <label className="flex items-center text-xs font-medium text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={includeWater}
+                      onChange={(e) => setIncludeWater(e.target.checked)}
+                      className="mr-2"
+                    />
+                    Include Water (sea, lakes, rivers)
+                  </label>
+                </div>
               </div>
             )}
 
@@ -259,6 +273,7 @@ export default function App() {
                   <div>Vertices: {result.stats.vertices.toLocaleString()}</div>
                   <div>Triangles: {result.stats.triangles.toLocaleString()}</div>
                   <div>Buildings: {result.stats.buildings_count}</div>
+                  <div>Water features: {result.stats.water_features_count ?? 0}</div>
                   <div>Area: {result.stats.area_km2.toFixed(4)} km²</div>
                 </div>
               </div>

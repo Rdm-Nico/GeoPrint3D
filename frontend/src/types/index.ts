@@ -12,6 +12,7 @@ export interface GenerateRequest {
   base_height?: number;
   include_buildings?: boolean;
   print_size?: number;  // Largest XY print dimension in mm (default: 180)
+  include_water?: boolean;  // Sea / lakes / rivers (default: true)
 }
 
 export interface MeshStats {
@@ -21,18 +22,29 @@ export interface MeshStats {
   min_elevation: number;
   max_elevation: number;
   buildings_count: number;
+  water_features_count?: number;
 }
 
 export interface MeshData {
   vertices: [number, number, number][];  // [x, y, z] positions
   triangles: [number, number, number][]; // Triangle indices into vertices
-  terrain_triangle_count: number;        // triangles[0..this] are terrain
+  terrain_triangle_count: number;        // triangles[0..this] are terrain (water included)
   building_triangle_count: number;       // triangles[terrain_tc..terrain_tc+this] are buildings
+  water_triangle_count?: number;         // the LAST this-many terrain triangles are water surface
 }
 
 export interface GenerateResponse {
   stats: MeshStats;
   mesh_data: MeshData;  // The actual 3D mesh data for rendering
+}
+
+// Colours of the model layers in the 3D preview (see config/presets.ts).
+export interface ModelColors {
+  terrain: string;
+  buildings: string;
+  greenAreas: string;
+  roads: string;
+  water: string;
 }
 
 export interface MapBounds {

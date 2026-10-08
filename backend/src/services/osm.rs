@@ -1,4 +1,6 @@
-use crate::models::{BoundingBox, Building, HeightSource, RoofShape};
+use crate::models::{
+    BoundingBox, Building, HeightSource, RoofShape, WaterArea, WaterFeatures, WaterKind, Waterway,
+};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -43,7 +45,30 @@ struct HeightSources {
 struct FetchStats {
     src: HeightSources,
     relations: usize,
+    /// Water elements dropped (underground / culverted / open rings).
+    water_skipped: usize,
 }
+
+/// Which feature classes one fetch asks OSM for. Buildings and water travel
+/// in the SAME per-tile query, so enabling water costs no extra Overpass
+/// round trips (and no extra pressure on the mirrors' rate limits).
+#[derive(Clone, Copy, Debug)]
+pub struct FetchOptions {
+    pub buildings: bool,
+    pub water: bool,
+}
+
+/// Everything one fetch returns.
+#[derive(Default)]
+pub struct OsmFeatures {
+    pub buildings: Vec<Building>,
+    pub water: WaterFeatures,
+}
+
+// Default widths (m) of linear waterways without a `width` tag.
+const RIVER_DEFAULT_WIDTH_M: f32 = 12.0;
+const CANAL_DEFAULT_WIDTH_M: f32 = 8.0;
+const STREAM_DEFAULT_WIDTH_M: f32 = 2.0;
 
 // A failed tile is split 2×2 and retried, at most this many times
 // (4 km² → 1 km² → 0.25 km²). Catches both Overpass stalls on dense tiles and
@@ -171,15 +196,23 @@ impl OsmService {
         Self { client }
     }
 
-    /// Fetch building footprints, heights and roof shapes from OSM.
+    /// Fetch building footprints, heights and roof shapes — and/or water
+    /// features — from OSM, depending on `opts`.
     ///
-    /// Fetched element classes:
+    /// Fetched building element classes:
     ///   - `way[building]`                — plain building outlines
     ///   - `way[building:part]`           — Simple 3D Buildings parts (domes, towers,
     ///                                      naves at different heights / min_height)
     ///   - `relation[type=multipolygon]`  — buildings with courtyards (inner rings)
     ///                                      or outlines split across several ways
     ///                                      (e.g. St Peter's colonnade)
+    ///
+    /// Fetched water element classes (see `classify_element`):
+    ///   - `natural=water` ways / multipolygons (+ legacy `waterway=riverbank`,
+    ///     `landuse=reservoir`) — lakes, ponds, river and canal areas
+    ///   - `waterway=river|canal|stream` ways — linear waterways (flow direction)
+    ///   - `natural=coastline` ways — assembled into sea polygons by
+    ///     `services::water` (land on the LEFT of the way)
     ///
     /// Strategy: the bbox is split into ≤TILE_MAX_KM2 tiles, ALL fetched
     /// concurrently (bounded by MAX_CONCURRENT_TILES); within a tile the
@@ -189,8 +222,16 @@ impl OsmService {
     /// runs under OSM_PHASE_BUDGET.
     /// `min_area_m2` is the print-resolution-aware footprint filter computed by
     /// the handler (floored at MIN_BUILDING_AREA_M2 here).
-    pub async fn fetch_buildings(&self, bbox: &BoundingBox, min_area_m2: f64) -> Result<Vec<Building>> {
-        tracing::info!("   ┌─ OpenStreetMap Building Service");
+    pub async fn fetch_features(
+        &self,
+        bbox: &BoundingBox,
+        opts: FetchOptions,
+        min_area_m2: f64,
+    ) -> Result<OsmFeatures> {
+        tracing::info!(
+            "   ┌─ OpenStreetMap Feature Service (buildings: {}, water: {})",
+            opts.buildings, opts.water
+        );
         tracing::info!(
             "   │  Bbox: ({:.4}, {:.4}) → ({:.4}, {:.4})",
             bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon
@@ -223,7 +264,7 @@ impl OsmService {
             seq += 1;
             tasks.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-                let result = fetch_tile_raw(&client, &tile, mirror_seq, deadline).await;
+                let result = fetch_tile_raw(&client, &tile, mirror_seq, deadline, opts).await;
                 (key, depth, tile, result)
             });
         };
@@ -276,17 +317,21 @@ impl OsmService {
         // occurrence anyway, because clipping always uses the FULL request bbox.
         raw_tiles.sort_by_key(|(key, _)| *key);
         let mut seen: HashSet<(bool, u64)> = HashSet::new();
-        let mut buildings: Vec<Building> = Vec::new();
+        let mut out = OsmFeatures::default();
         let mut stats = FetchStats::default();
         let mut ok_tiles = 0usize;
         for (key, fetched) in raw_tiles {
+            let mut ctx = ParseCtx {
+                bbox,
+                min_area_m2,
+                opts,
+                seen: &mut seen,
+                out: &mut out,
+                stats: &mut stats,
+            };
             let parsed = match fetched.data {
-                RawTile::Geom(v) => {
-                    self.parse_geom_response(v, bbox, min_area_m2, &mut seen, &mut buildings, &mut stats)
-                }
-                RawTile::NodeRefs(v) => {
-                    self.parse_noderefs_response(v, bbox, min_area_m2, &mut seen, &mut buildings, &mut stats)
-                }
+                RawTile::Geom(v) => parse_geom_response(v, &mut ctx),
+                RawTile::NodeRefs(v) => parse_noderefs_response(v, &mut ctx),
             };
             match parsed {
                 Ok(()) => ok_tiles += 1,
@@ -307,192 +352,372 @@ impl OsmService {
             );
         }
 
-        let suppressed = suppress_covered_outlines(&mut buildings);
-        log_building_stats(&buildings, &stats.src, stats.relations, suppressed, request_start.elapsed());
-        Ok(buildings)
+        let mut buildings = std::mem::take(&mut out.buildings);
+        if opts.buildings {
+            let suppressed = suppress_covered_outlines(&mut buildings);
+            log_building_stats(&buildings, &stats.src, stats.relations, suppressed);
+        }
+        if opts.water {
+            log_water_stats(&out.water, stats.water_skipped);
+        }
+        tracing::info!("   └─ OSM processing time: {:.2}s", request_start.elapsed().as_secs_f64());
+        Ok(OsmFeatures { buildings, water: std::mem::take(&mut out.water) })
+    }
+}
+
+// ── Parsers ───────────────────────────────────────────────────────────────────
+// Both parsers route every element through `classify_element`, so the
+// Overpass (`out geom`) path and the OSM-direct-API (node-ref) fallback
+// accept exactly the same element classes. Keep them in sync.
+
+/// Shared mutable state of the ordered merge (one per fetch).
+struct ParseCtx<'a> {
+    bbox: &'a BoundingBox,
+    min_area_m2: f64,
+    opts: FetchOptions,
+    seen: &'a mut HashSet<(bool, u64)>,
+    out: &'a mut OsmFeatures,
+    stats: &'a mut FetchStats,
+}
+
+/// What an OSM element contributes to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementClass {
+    Building,
+    WaterArea(WaterKind),
+    Waterway(WaterKind),
+    Coastline,
+    Skip,
+}
+
+/// Route an element by its tags. Buildings win over water tags (a building
+/// outline that also carries `natural=water` is still a building). Relations
+/// must be multipolygons; waterways and coastlines are ways only.
+fn classify_element(tags: &Value, is_relation: bool, opts: FetchOptions) -> ElementClass {
+    let tag = |k: &str| tags[k].as_str();
+    if is_relation && tag("type") != Some("multipolygon") {
+        return ElementClass::Skip;
     }
 
-    // ── Parsers ───────────────────────────────────────────────────────────────
-
-    /// Parse an Overpass `out geom` response.
-    /// Ways carry a `geometry` array with inline lat/lon objects; relations carry
-    /// per-member geometry with `outer`/`inner` roles.
-    fn parse_geom_response(
-        &self,
-        data: Value,
-        bbox: &BoundingBox,
-        min_area_m2: f64,
-        seen: &mut std::collections::HashSet<(bool, u64)>,
-        out: &mut Vec<Building>,
-        stats: &mut FetchStats,
-    ) -> Result<()> {
-        let elements = data["elements"]
-            .as_array()
-            .context("Missing 'elements' in Overpass response")?;
-
-        tracing::debug!("   │  Parsing {} OSM elements", elements.len());
-
-        for el in elements.iter() {
-            let tags = &el["tags"];
-            let id = el["id"].as_u64().unwrap_or(0);
-
-            match el["type"].as_str().unwrap_or("") {
-                "way" => {
-                    if !seen.insert((false, id)) {
-                        continue; // already parsed via a neighbouring tile
-                    }
-                    let Some(geometry) = el["geometry"].as_array() else {
-                        stats.src.skipped += 1;
-                        continue;
-                    };
-                    let footprint: Vec<(f64, f64)> = geometry
-                        .iter()
-                        .filter_map(|g| Some((g["lon"].as_f64()?, g["lat"].as_f64()?)))
-                        .collect();
-                    push_building(out, id, footprint, Vec::new(), tags, bbox, min_area_m2, &mut stats.src);
-                }
-                "relation" => {
-                    if !seen.insert((true, id)) {
-                        continue;
-                    }
-                    let Some(members) = el["members"].as_array() else {
-                        continue;
-                    };
-                    stats.relations += 1;
-                    let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                    let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                    for m in members {
-                        let Some(geom) = m["geometry"].as_array() else {
-                            continue;
-                        };
-                        let line: Vec<(f64, f64)> = geom
-                            .iter()
-                            .filter_map(|g| Some((g["lon"].as_f64()?, g["lat"].as_f64()?)))
-                            .collect();
-                        if line.len() < 2 {
-                            continue;
-                        }
-                        if m["role"].as_str() == Some("inner") {
-                            inner_segments.push(line);
-                        } else {
-                            outer_segments.push(line);
-                        }
-                    }
-                    push_relation(out, id, outer_segments, inner_segments, tags, bbox, min_area_m2, &mut stats.src);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
+    let is_building = tag("building").is_some_and(|v| v != "no");
+    let is_part = tag("building:part").is_some_and(|v| v != "no");
+    if is_building || is_part {
+        return if opts.buildings { ElementClass::Building } else { ElementClass::Skip };
+    }
+    if !opts.water {
+        return ElementClass::Skip;
     }
 
-    /// Parse an OSM direct API response (node-ref format).
-    /// Ways reference node IDs; relations reference way IDs. Coordinates are
-    /// resolved through the node list.
-    fn parse_noderefs_response(
-        &self,
-        data: Value,
-        bbox: &BoundingBox,
-        min_area_m2: f64,
-        seen: &mut std::collections::HashSet<(bool, u64)>,
-        out: &mut Vec<Building>,
-        stats: &mut FetchStats,
-    ) -> Result<()> {
-        let elements = data["elements"]
-            .as_array()
-            .context("Missing 'elements' in OSM API response")?;
+    // Water that is not visible from above (culverts, covered reservoirs,
+    // underground channels) is not modelled.
+    let hidden = tag("tunnel").is_some_and(|v| v != "no")
+        || tag("covered").is_some_and(|v| v != "no")
+        || matches!(tag("location"), Some("underground" | "indoor"));
 
-        tracing::debug!("   │  Parsing {} total OSM elements", elements.len());
+    if !is_relation && tag("natural") == Some("coastline") {
+        return ElementClass::Coastline;
+    }
 
-        // Build node-id → (lon, lat) map
-        let mut nodes: HashMap<u64, (f64, f64)> = HashMap::new();
-        for el in elements.iter() {
-            if el["type"] == "node" {
-                if let (Some(id), Some(lat), Some(lon)) =
-                    (el["id"].as_u64(), el["lat"].as_f64(), el["lon"].as_f64())
-                {
-                    nodes.insert(id, (lon, lat));
+    let is_area = tag("natural") == Some("water")
+        || tag("waterway") == Some("riverbank")
+        || tag("landuse") == Some("reservoir");
+    if is_area {
+        if hidden {
+            return ElementClass::Skip;
+        }
+        let kind = if tag("waterway") == Some("riverbank") {
+            WaterKind::River
+        } else {
+            match tag("water") {
+                Some("river" | "stream" | "rapids") => WaterKind::River,
+                Some("canal" | "ditch" | "drain") => WaterKind::Canal,
+                _ => WaterKind::Lake, // lake, pond, reservoir, basin, oxbow, lagoon…
+            }
+        };
+        return ElementClass::WaterArea(kind);
+    }
+
+    if !is_relation {
+        let kind = match tag("waterway") {
+            Some("river") => Some(WaterKind::River),
+            Some("canal") => Some(WaterKind::Canal),
+            Some("stream") => Some(WaterKind::Stream),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            // Seasonal streams are dry most of the year; seasonal rivers keep
+            // a visible bed and stay.
+            let dry_stream = kind == WaterKind::Stream && tag("intermittent") == Some("yes");
+            if hidden || dry_stream {
+                return ElementClass::Skip;
+            }
+            return ElementClass::Waterway(kind);
+        }
+    }
+
+    ElementClass::Skip
+}
+
+/// Parse an Overpass `out geom` response.
+/// Ways carry a `geometry` array with inline lat/lon objects; relations carry
+/// per-member geometry with `outer`/`inner` roles.
+fn parse_geom_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
+    let elements = data["elements"]
+        .as_array()
+        .context("Missing 'elements' in Overpass response")?;
+
+    tracing::debug!("   │  Parsing {} OSM elements", elements.len());
+
+    let coords_of = |geom: &Vec<Value>| -> Vec<(f64, f64)> {
+        geom.iter()
+            .filter_map(|g| Some((g["lon"].as_f64()?, g["lat"].as_f64()?)))
+            .collect()
+    };
+
+    for el in elements.iter() {
+        let tags = &el["tags"];
+        let id = el["id"].as_u64().unwrap_or(0);
+
+        match el["type"].as_str().unwrap_or("") {
+            "way" => {
+                let class = classify_element(tags, false, ctx.opts);
+                if class == ElementClass::Skip {
+                    continue;
                 }
+                if !ctx.seen.insert((false, id)) {
+                    continue; // already parsed via a neighbouring tile
+                }
+                let Some(geometry) = el["geometry"].as_array() else {
+                    ctx.stats.src.skipped += 1;
+                    continue;
+                };
+                push_way(ctx, class, id, coords_of(geometry), tags);
+            }
+            "relation" => {
+                let class = classify_element(tags, true, ctx.opts);
+                if class == ElementClass::Skip {
+                    continue;
+                }
+                if !ctx.seen.insert((true, id)) {
+                    continue;
+                }
+                let Some(members) = el["members"].as_array() else {
+                    continue;
+                };
+                let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
+                let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
+                for m in members {
+                    let Some(geom) = m["geometry"].as_array() else {
+                        continue;
+                    };
+                    let line = coords_of(geom);
+                    if line.len() < 2 {
+                        continue;
+                    }
+                    if m["role"].as_str() == Some("inner") {
+                        inner_segments.push(line);
+                    } else {
+                        outer_segments.push(line);
+                    }
+                }
+                push_multipolygon(ctx, class, id, outer_segments, inner_segments, tags);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse an OSM direct API response (node-ref format).
+/// Ways reference node IDs; relations reference way IDs. Coordinates are
+/// resolved through the node list. Note: the map call does not return the
+/// members of a relation that lie outside the bbox, so large water
+/// multipolygons can arrive incomplete — their open rings are dropped by
+/// `assemble_rings` (partial coverage, never wrong geometry).
+fn parse_noderefs_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
+    let elements = data["elements"]
+        .as_array()
+        .context("Missing 'elements' in OSM API response")?;
+
+    tracing::debug!("   │  Parsing {} total OSM elements", elements.len());
+
+    // Build node-id → (lon, lat) map
+    let mut nodes: HashMap<u64, (f64, f64)> = HashMap::new();
+    for el in elements.iter() {
+        if el["type"] == "node" {
+            if let (Some(id), Some(lat), Some(lon)) =
+                (el["id"].as_u64(), el["lat"].as_f64(), el["lon"].as_f64())
+            {
+                nodes.insert(id, (lon, lat));
             }
         }
+    }
 
-        // Build way-id → coordinate-list map (all ways: multipolygon members
-        // usually carry no building tag themselves).
-        let mut ways: HashMap<u64, Vec<(f64, f64)>> = HashMap::new();
-        for el in elements.iter() {
-            if el["type"] != "way" {
-                continue;
+    // Build way-id → coordinate-list map (all ways: multipolygon members
+    // usually carry no building tag themselves).
+    let mut ways: HashMap<u64, Vec<(f64, f64)>> = HashMap::new();
+    for el in elements.iter() {
+        if el["type"] != "way" {
+            continue;
+        }
+        let (Some(id), Some(node_refs)) = (el["id"].as_u64(), el["nodes"].as_array()) else {
+            continue;
+        };
+        let coords: Vec<(f64, f64)> = node_refs
+            .iter()
+            .filter_map(|r| r.as_u64())
+            .filter_map(|nid| nodes.get(&nid).copied())
+            .collect();
+        ways.insert(id, coords);
+    }
+
+    for el in elements.iter() {
+        let tags = &el["tags"];
+        let id = el["id"].as_u64().unwrap_or(0);
+
+        match el["type"].as_str().unwrap_or("") {
+            "way" => {
+                let class = classify_element(tags, false, ctx.opts);
+                if class == ElementClass::Skip {
+                    continue;
+                }
+                if !ctx.seen.insert((false, id)) {
+                    continue;
+                }
+                let coords = ways.get(&id).cloned().unwrap_or_default();
+                if coords.len() < 2 {
+                    ctx.stats.src.skipped += 1;
+                    continue;
+                }
+                push_way(ctx, class, id, coords, tags);
             }
-            let (Some(id), Some(node_refs)) = (el["id"].as_u64(), el["nodes"].as_array()) else {
-                continue;
+            "relation" => {
+                let class = classify_element(tags, true, ctx.opts);
+                if class == ElementClass::Skip {
+                    continue;
+                }
+                if !ctx.seen.insert((true, id)) {
+                    continue;
+                }
+                let Some(members) = el["members"].as_array() else {
+                    continue;
+                };
+                let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
+                let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
+                for m in members {
+                    if m["type"] != "way" {
+                        continue;
+                    }
+                    let Some(coords) = m["ref"].as_u64().and_then(|r| ways.get(&r)).cloned() else {
+                        continue;
+                    };
+                    if coords.len() < 2 {
+                        continue;
+                    }
+                    if m["role"].as_str() == Some("inner") {
+                        inner_segments.push(coords);
+                    } else {
+                        outer_segments.push(coords);
+                    }
+                }
+                push_multipolygon(ctx, class, id, outer_segments, inner_segments, tags);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch one parsed way by class.
+fn push_way(ctx: &mut ParseCtx, class: ElementClass, id: u64, coords: Vec<(f64, f64)>, tags: &Value) {
+    match class {
+        ElementClass::Building => {
+            if coords.len() < 3 {
+                ctx.stats.src.skipped += 1;
+                return;
+            }
+            push_building(
+                &mut ctx.out.buildings, id, coords, Vec::new(), tags,
+                ctx.bbox, ctx.min_area_m2, &mut ctx.stats.src,
+            );
+        }
+        ElementClass::WaterArea(kind) => match closed_ring(coords) {
+            Some(outer) => ctx.out.water.areas.push(WaterArea { id, kind, outer, holes: Vec::new() }),
+            // Open water ways are usually multipolygon members that also
+            // carry tags; the relation provides the area.
+            None => ctx.stats.water_skipped += 1,
+        },
+        ElementClass::Waterway(kind) => {
+            let default_width = match kind {
+                WaterKind::River => RIVER_DEFAULT_WIDTH_M,
+                WaterKind::Canal => CANAL_DEFAULT_WIDTH_M,
+                _ => STREAM_DEFAULT_WIDTH_M,
             };
-            let coords: Vec<(f64, f64)> = node_refs
-                .iter()
-                .filter_map(|r| r.as_u64())
-                .filter_map(|nid| nodes.get(&nid).copied())
-                .collect();
-            ways.insert(id, coords);
+            let width_m = tags["width"]
+                .as_str()
+                .and_then(parse_meters)
+                .filter(|w| *w > 0.0 && *w < 2000.0)
+                .unwrap_or(default_width);
+            ctx.out.water.waterways.push(Waterway { id, kind, line: coords, width_m });
         }
-
-        for el in elements.iter() {
-            let tags = &el["tags"];
-            let id = el["id"].as_u64().unwrap_or(0);
-            let is_building = tags["building"].is_string() && tags["building"] != "no";
-            let is_part = tags["building:part"].is_string() && tags["building:part"] != "no";
-            if !is_building && !is_part {
-                continue;
-            }
-
-            match el["type"].as_str().unwrap_or("") {
-                "way" => {
-                    if !seen.insert((false, id)) {
-                        continue;
-                    }
-                    let footprint = ways.get(&id).cloned().unwrap_or_default();
-                    if footprint.len() < 3 {
-                        stats.src.skipped += 1;
-                        continue;
-                    }
-                    push_building(out, id, footprint, Vec::new(), tags, bbox, min_area_m2, &mut stats.src);
-                }
-                "relation" => {
-                    if tags["type"] != "multipolygon" {
-                        continue;
-                    }
-                    if !seen.insert((true, id)) {
-                        continue;
-                    }
-                    let Some(members) = el["members"].as_array() else {
-                        continue;
-                    };
-                    stats.relations += 1;
-                    let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                    let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                    for m in members {
-                        if m["type"] != "way" {
-                            continue;
-                        }
-                        let Some(coords) = m["ref"].as_u64().and_then(|r| ways.get(&r)).cloned() else {
-                            continue;
-                        };
-                        if coords.len() < 2 {
-                            continue;
-                        }
-                        if m["role"].as_str() == Some("inner") {
-                            inner_segments.push(coords);
-                        } else {
-                            outer_segments.push(coords);
-                        }
-                    }
-                    push_relation(out, id, outer_segments, inner_segments, tags, bbox, min_area_m2, &mut stats.src);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
+        ElementClass::Coastline => ctx.out.water.coastlines.push((id, coords)),
+        ElementClass::Skip => {}
     }
+}
+
+/// Dispatch one parsed multipolygon relation by class.
+fn push_multipolygon(
+    ctx: &mut ParseCtx,
+    class: ElementClass,
+    id: u64,
+    outer_segments: Vec<Vec<(f64, f64)>>,
+    inner_segments: Vec<Vec<(f64, f64)>>,
+    tags: &Value,
+) {
+    match class {
+        ElementClass::Building => {
+            ctx.stats.relations += 1;
+            push_relation(
+                &mut ctx.out.buildings, id, outer_segments, inner_segments, tags,
+                ctx.bbox, ctx.min_area_m2, &mut ctx.stats.src,
+            );
+        }
+        ElementClass::WaterArea(kind) => {
+            // No bbox clipping here: hydro clips in metres against the
+            // terrain hull, and a lake's shore outside the bbox is irrelevant.
+            let outer_rings = assemble_rings(outer_segments);
+            let inner_rings = assemble_rings(inner_segments);
+            if outer_rings.is_empty() {
+                ctx.stats.water_skipped += 1;
+            }
+            for outer in outer_rings {
+                let holes: Vec<Vec<(f64, f64)>> = inner_rings
+                    .iter()
+                    .filter(|h| !h.is_empty() && point_in_ring(h[0], &outer))
+                    .cloned()
+                    .collect();
+                ctx.out.water.areas.push(WaterArea { id, kind, outer, holes });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A closed way's ring without the repeated closing node; `None` if the way
+/// is not closed (or too short to enclose anything).
+fn closed_ring(mut coords: Vec<(f64, f64)>) -> Option<Vec<(f64, f64)>> {
+    const EPS: f64 = 1e-9;
+    if coords.len() < 4 {
+        return None;
+    }
+    let (f, l) = (coords[0], *coords.last().unwrap());
+    if (f.0 - l.0).abs() > EPS || (f.1 - l.1).abs() > EPS {
+        return None;
+    }
+    coords.pop();
+    Some(coords)
 }
 
 // ── Tile fetching (hedged race) ───────────────────────────────────────────────
@@ -508,22 +733,9 @@ async fn fetch_tile_raw(
     tile: &BoundingBox,
     seq: usize,
     deadline: Instant,
+    opts: FetchOptions,
 ) -> Result<FetchedTile> {
-    // `out geom qt` returns coordinates inline — ~10× smaller than
-    // `out body;>;out skel qt` because no separate node objects are emitted.
-    // Relations include per-member geometry and roles (outer/inner).
-    let bb = format!(
-        "{},{},{},{}",
-        tile.min_lat, tile.min_lon, tile.max_lat, tile.max_lon
-    );
-    let overpass_query = format!(
-        "[out:json][timeout:20];(\
-         way[\"building\"][\"building\"!=\"no\"]({bb});\
-         way[\"building:part\"][\"building:part\"!=\"no\"]({bb});\
-         relation[\"type\"=\"multipolygon\"][\"building\"][\"building\"!=\"no\"]({bb});\
-         relation[\"type\"=\"multipolygon\"][\"building:part\"][\"building:part\"!=\"no\"]({bb});\
-         );out geom qt;"
-    );
+    let overpass_query = overpass_query(tile, opts);
 
     let n_mirrors = OVERPASS_ENDPOINTS.len();
     let mut attempts: JoinSet<Result<FetchedTile>> = JoinSet::new();
@@ -553,6 +765,40 @@ async fn fetch_tile_raw(
         }
     }
     anyhow::bail!("all sources failed: {}", errors.join(" | "))
+}
+
+/// Build one tile's Overpass union query for the requested feature classes.
+/// `out geom qt` returns coordinates inline — ~10× smaller than
+/// `out body;>;out skel qt` because no separate node objects are emitted.
+/// Relations include per-member geometry and roles (outer/inner).
+fn overpass_query(tile: &BoundingBox, opts: FetchOptions) -> String {
+    let bb = format!(
+        "{},{},{},{}",
+        tile.min_lat, tile.min_lon, tile.max_lat, tile.max_lon
+    );
+    let mut q = String::from("[out:json][timeout:20];(");
+    if opts.buildings {
+        q.push_str(&format!(
+            "way[\"building\"][\"building\"!=\"no\"]({bb});\
+             way[\"building:part\"][\"building:part\"!=\"no\"]({bb});\
+             relation[\"type\"=\"multipolygon\"][\"building\"][\"building\"!=\"no\"]({bb});\
+             relation[\"type\"=\"multipolygon\"][\"building:part\"][\"building:part\"!=\"no\"]({bb});"
+        ));
+    }
+    if opts.water {
+        q.push_str(&format!(
+            "way[\"natural\"=\"water\"]({bb});\
+             relation[\"type\"=\"multipolygon\"][\"natural\"=\"water\"]({bb});\
+             way[\"waterway\"=\"riverbank\"]({bb});\
+             relation[\"type\"=\"multipolygon\"][\"waterway\"=\"riverbank\"]({bb});\
+             way[\"landuse\"=\"reservoir\"]({bb});\
+             relation[\"type\"=\"multipolygon\"][\"landuse\"=\"reservoir\"]({bb});\
+             way[\"waterway\"~\"^(river|canal|stream)$\"]({bb});\
+             way[\"natural\"=\"coastline\"]({bb});"
+        ));
+    }
+    q.push_str(");out geom qt;");
+    q
 }
 
 /// One delayed Overpass request (the delay implements the hedge stagger).
@@ -1058,12 +1304,29 @@ fn corner_count(footprint: &[(f64, f64)]) -> usize {
     n
 }
 
+fn log_water_stats(water: &WaterFeatures, skipped: usize) {
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for a in &water.areas {
+        *by_kind.entry(a.kind.name()).or_insert(0) += 1;
+    }
+    let mut lines: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for w in &water.waterways {
+        *lines.entry(w.kind.name()).or_insert(0) += 1;
+    }
+    tracing::info!(
+        "   │  💧 Water: {} area(s) {:?}, {} waterway(s) {:?}, {} coastline way(s)",
+        water.areas.len(), by_kind, water.waterways.len(), lines, water.coastlines.len()
+    );
+    if skipped > 0 {
+        tracing::debug!("   │  Skipped {} water element(s) (open rings)", skipped);
+    }
+}
+
 fn log_building_stats(
     buildings: &[Building],
     src: &HeightSources,
     relations: usize,
     suppressed: usize,
-    elapsed: Duration,
 ) {
     if buildings.is_empty() {
         tracing::info!("   │  ⚠ No printable buildings found");
@@ -1087,7 +1350,6 @@ fn log_building_stats(
     if src.skipped > 0 {
         tracing::debug!("   │  Skipped {} elements (no geometry / too small)", src.skipped);
     }
-    tracing::info!("   └─ OSM processing time: {:.2}s", elapsed.as_secs_f64());
 }
 
 /// Shoelace formula for polygon area in m² on a (lon, lat) ring.
@@ -1111,5 +1373,123 @@ pub fn footprint_area_m2(pts: &[(f64, f64)]) -> f64 {
 impl Default for OsmService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const ALL: FetchOptions = FetchOptions { buildings: true, water: true };
+
+    #[test]
+    fn classify_routes_by_tags() {
+        let c = |t: Value, rel: bool| classify_element(&t, rel, ALL);
+        assert_eq!(c(json!({"building": "yes"}), false), ElementClass::Building);
+        assert_eq!(c(json!({"natural": "water"}), false), ElementClass::WaterArea(WaterKind::Lake));
+        assert_eq!(c(json!({"natural": "water", "water": "river"}), false), ElementClass::WaterArea(WaterKind::River));
+        assert_eq!(c(json!({"waterway": "riverbank"}), false), ElementClass::WaterArea(WaterKind::River));
+        assert_eq!(c(json!({"landuse": "reservoir"}), false), ElementClass::WaterArea(WaterKind::Lake));
+        assert_eq!(
+            c(json!({"type": "multipolygon", "natural": "water", "water": "canal"}), true),
+            ElementClass::WaterArea(WaterKind::Canal)
+        );
+        assert_eq!(c(json!({"natural": "water"}), true), ElementClass::Skip, "relation must be a multipolygon");
+        assert_eq!(c(json!({"natural": "water", "covered": "yes"}), false), ElementClass::Skip);
+        assert_eq!(c(json!({"waterway": "river"}), false), ElementClass::Waterway(WaterKind::River));
+        assert_eq!(c(json!({"waterway": "stream", "tunnel": "culvert"}), false), ElementClass::Skip);
+        assert_eq!(c(json!({"waterway": "stream", "intermittent": "yes"}), false), ElementClass::Skip);
+        assert_eq!(
+            c(json!({"waterway": "river", "intermittent": "yes"}), false),
+            ElementClass::Waterway(WaterKind::River),
+            "seasonal rivers keep their bed"
+        );
+        assert_eq!(c(json!({"waterway": "ditch"}), false), ElementClass::Skip);
+        assert_eq!(c(json!({"natural": "coastline"}), false), ElementClass::Coastline);
+        // Buildings win over water tags; disabled classes are skipped.
+        assert_eq!(c(json!({"building": "yes", "natural": "water"}), false), ElementClass::Building);
+        let water_only = FetchOptions { buildings: false, water: true };
+        assert_eq!(classify_element(&json!({"building": "yes"}), false, water_only), ElementClass::Skip);
+        let buildings_only = FetchOptions { buildings: true, water: false };
+        assert_eq!(classify_element(&json!({"natural": "water"}), false, buildings_only), ElementClass::Skip);
+    }
+
+    fn bbox() -> BoundingBox {
+        BoundingBox { min_lat: 44.49, min_lon: 11.33, max_lat: 44.50, max_lon: 11.345 }
+    }
+
+    // A ~40 × 40 m square at (lon0, lat0), closed.
+    fn square(lon0: f64, lat0: f64) -> Vec<(f64, f64)> {
+        let (dx, dy) = (0.0005, 0.00036);
+        vec![(lon0, lat0), (lon0 + dx, lat0), (lon0 + dx, lat0 + dy), (lon0, lat0 + dy), (lon0, lat0)]
+    }
+
+    fn check(out: &OsmFeatures) {
+        assert_eq!(out.buildings.len(), 1, "one building");
+        assert_eq!(out.water.areas.len(), 1, "one lake");
+        assert_eq!(out.water.areas[0].outer.len(), 4, "closing node dropped");
+        assert_eq!(out.water.waterways.len(), 1, "culverted stream dropped, river kept");
+        assert_eq!(out.water.waterways[0].width_m, 25.0, "width tag parsed");
+        assert_eq!(out.water.coastlines.len(), 1);
+    }
+
+    fn parse(data: Value, noderefs: bool) -> OsmFeatures {
+        let b = bbox();
+        let mut seen = HashSet::new();
+        let mut out = OsmFeatures::default();
+        let mut stats = FetchStats::default();
+        let mut ctx = ParseCtx { bbox: &b, min_area_m2: 10.0, opts: ALL, seen: &mut seen, out: &mut out, stats: &mut stats };
+        if noderefs {
+            parse_noderefs_response(data, &mut ctx).unwrap();
+        } else {
+            parse_geom_response(data, &mut ctx).unwrap();
+        }
+        out
+    }
+
+    fn ways() -> Vec<(u64, Value, Vec<(f64, f64)>)> {
+        vec![
+            (1, json!({"building": "yes"}), square(11.335, 44.495)),
+            (2, json!({"natural": "water"}), square(11.340, 44.495)),
+            (3, json!({"waterway": "river", "width": "25 m"}), vec![(11.33, 44.492), (11.345, 44.492)]),
+            (4, json!({"waterway": "stream", "tunnel": "culvert"}), vec![(11.33, 44.498), (11.34, 44.498)]),
+            (5, json!({"natural": "coastline"}), vec![(11.32, 44.491), (11.35, 44.491)]),
+        ]
+    }
+
+    #[test]
+    fn overpass_geom_parser_dispatches_water() {
+        let elements: Vec<Value> = ways()
+            .into_iter()
+            .map(|(id, tags, pts)| {
+                json!({
+                    "type": "way", "id": id, "tags": tags,
+                    "geometry": pts.iter().map(|&(lon, lat)| json!({"lon": lon, "lat": lat})).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        check(&parse(json!({ "elements": elements }), false));
+    }
+
+    #[test]
+    fn direct_api_parser_dispatches_water() {
+        let mut elements: Vec<Value> = Vec::new();
+        let mut next_node = 100u64;
+        let mut node_of: HashMap<(u64, u64), u64> = HashMap::new();
+        for (id, tags, pts) in ways() {
+            let refs: Vec<u64> = pts
+                .iter()
+                .map(|&(lon, lat)| {
+                    *node_of.entry((lon.to_bits(), lat.to_bits())).or_insert_with(|| {
+                        next_node += 1;
+                        elements.push(json!({"type": "node", "id": next_node, "lon": lon, "lat": lat}));
+                        next_node
+                    })
+                })
+                .collect();
+            elements.push(json!({"type": "way", "id": id, "tags": tags, "nodes": refs}));
+        }
+        check(&parse(json!({ "elements": elements }), true));
     }
 }

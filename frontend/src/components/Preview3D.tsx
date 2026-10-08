@@ -4,6 +4,7 @@ import { OrbitControls, PerspectiveCamera, Grid } from '@react-three/drei';
 import * as THREE from 'three';
 import type { Mesh } from 'three';
 import type { MeshData, MeshStats } from '../types';
+import { DEFAULT_COLORS } from '../config/presets';
 
 interface Preview3DProps {
   meshData?: MeshData;
@@ -63,22 +64,35 @@ function buildIndices(
   return arr;
 }
 
-// Renders the real terrain mesh split into two coloured layers:
-//   - Terrain surface → green
+// Renders the real terrain mesh split into three coloured layers:
+//   - Terrain surface (incl. shore walls) → green
+//   - Water surface (last water_triangle_count terrain triangles) → light blue
 //   - Building extrusions → concrete grey
 function TerrainMesh({ meshData }: { meshData: MeshData }) {
-  const { terrainGeo, buildingGeo } = useMemo(() => {
+  const { terrainGeo, waterGeo, buildingGeo } = useMemo(() => {
     const { cx, cy, cz, scale } = computeTransform(meshData.vertices);
     const positions = buildPositions(meshData.vertices, cx, cy, cz, scale);
 
     const terrainTc = meshData.terrain_triangle_count;
     const buildingTc = meshData.building_triangle_count;
+    // Older backends don't send the field: everything renders as terrain.
+    const waterTc = Math.min(meshData.water_triangle_count ?? 0, terrainTc);
+    const landTc = terrainTc - waterTc;
 
     // Terrain geometry
     const tGeo = new THREE.BufferGeometry();
     tGeo.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
-    tGeo.setIndex(new THREE.BufferAttribute(buildIndices(meshData.triangles, 0, terrainTc), 1));
+    tGeo.setIndex(new THREE.BufferAttribute(buildIndices(meshData.triangles, 0, landTc), 1));
     tGeo.computeVertexNormals();
+
+    // Water geometry (may be empty)
+    let wGeo: THREE.BufferGeometry | null = null;
+    if (waterTc > 0) {
+      wGeo = new THREE.BufferGeometry();
+      wGeo.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+      wGeo.setIndex(new THREE.BufferAttribute(buildIndices(meshData.triangles, landTc, terrainTc), 1));
+      wGeo.computeVertexNormals();
+    }
 
     // Building geometry (may be empty)
     let bGeo: THREE.BufferGeometry | null = null;
@@ -91,7 +105,7 @@ function TerrainMesh({ meshData }: { meshData: MeshData }) {
       bGeo.computeVertexNormals();
     }
 
-    return { terrainGeo: tGeo, buildingGeo: bGeo };
+    return { terrainGeo: tGeo, waterGeo: wGeo, buildingGeo: bGeo };
   }, [meshData]);
 
   return (
@@ -106,6 +120,17 @@ function TerrainMesh({ meshData }: { meshData: MeshData }) {
           side={THREE.DoubleSide}
         />
       </mesh>
+      {waterGeo && (
+        <mesh geometry={waterGeo}>
+          <meshStandardMaterial
+            color={DEFAULT_COLORS.water}
+            roughness={0.25}
+            metalness={0.1}
+            flatShading={true}
+            side={THREE.DoubleSide}
+          />
+        </mesh>
+      )}
       {buildingGeo && (
         <mesh geometry={buildingGeo}>
           <meshStandardMaterial
@@ -196,6 +221,9 @@ export default function Preview3D({ meshData, stats }: Preview3DProps) {
           <div>Vertices: {stats.vertices.toLocaleString()}</div>
           <div>Triangles: {stats.triangles.toLocaleString()}</div>
           <div>Buildings: {stats.buildings_count.toLocaleString()}</div>
+          {(stats.water_features_count ?? 0) > 0 && (
+            <div>Water features: {stats.water_features_count?.toLocaleString()}</div>
+          )}
           <div>Elevation: {stats.min_elevation.toFixed(1)}m – {stats.max_elevation.toFixed(1)}m</div>
           <div>Area: {stats.area_km2.toFixed(4)} km²</div>
         </div>
@@ -210,6 +238,10 @@ export default function Preview3D({ meshData, stats }: Preview3DProps) {
         <div className="flex items-center gap-2">
           <span className="inline-block w-3 h-3 rounded-sm" style={{ background: '#c8b89a' }} />
           <span>Buildings</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="inline-block w-3 h-3 rounded-sm" style={{ background: DEFAULT_COLORS.water }} />
+          <span>Water</span>
         </div>
         <div className="mt-2 pt-2 border-t border-gray-600 space-y-1">
           <div>Left drag: Rotate</div>

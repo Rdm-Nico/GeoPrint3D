@@ -17,8 +17,8 @@ export const SIZE_PRESETS: SizePreset[] = [
 
 export const DEFAULT_PRINT_SIZE_MM = 260;
 
-// Colors rendered in the 3D preview. Roads / green areas / water are wired
-// UI-side and will take effect once the backend tags those mesh regions.
+// Colors rendered in the 3D preview. Roads / green areas are wired UI-side
+// and will take effect once the backend tags those mesh regions.
 export const DEFAULT_COLORS: ModelColors = {
   terrain: '#6aaa55', // green
   buildings: '#f2efe9', // chalk white
@@ -39,5 +39,5 @@ export const COLOR_ROWS: ColorRow[] = [
   { key: 'buildings', label: 'Buildings', icon: '🏢' },
   { key: 'greenAreas', label: 'Green areas', icon: '🌳', pending: true },
   { key: 'roads', label: 'Roads', icon: '🛣️', pending: true },
-  { key: 'water', label: 'Sea / River / Lake', icon: '💧', pending: true },
+  { key: 'water', label: 'Sea / River / Lake', icon: '💧' },
 ];

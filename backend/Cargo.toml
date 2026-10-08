@@ -18,7 +18,7 @@ serde_json = "1.0"
 reqwest = { version = "0.11", features = ["json"] }
 
 # Geospatial
-geo = "0.28"
+geo = "0.33"  # BooleanOps (i_overlay), Buffer, Simplify, Densify — water geometry
 geojson = "0.24"
 proj = "0.27"  # Coordinate projection (PROJ library)
 
@@ -26,6 +26,7 @@ proj = "0.27"  # Coordinate projection (PROJ library)
 nalgebra = "0.32"
 delaunator = "1.0"  # Delaunay triangulation
 earcutr = "0.4"     # Ear-clipping polygon triangulation (concave building footprints)
+spade = "2"         # Constrained Delaunay triangulation (water shorelines as constraint edges)
 
 # Raster decoding (Mapbox Terrain-RGB PNG tiles)
 image = { version = "0.25", default-features = false, features = ["png"] }
