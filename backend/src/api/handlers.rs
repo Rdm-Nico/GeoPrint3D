@@ -203,6 +203,27 @@ pub async fn generate_terrain(
         }
     };
 
+    // Contextual height inference: >90% of OSM outlines in typical Italian
+    // cities have no height, and the plain per-type default (yes → 8 m,
+    // apartments → 15 m) rendered a random 1:2 checkerboard. Replace those
+    // defaults with estimates from urban density, tagged neighbours and the
+    // building's block (see services::height_inference).
+    let mut inference_report = None;
+    if !buildings.is_empty() {
+        let report = crate::services::height_inference::infer_missing_heights(&mut buildings, &request.bbox);
+        tracing::info!(
+            "   └─ Height inference: {} element(s) estimated {:?}, {} block(s)",
+            report.inferred, report.by_source, report.blocks
+        );
+        if let Some((n, mae_new, mae_type)) = report.loo {
+            tracing::info!(
+                "   └─ Inference self-check (leave-one-out on {} tagged): MAE {:.1} m vs {:.1} m with type defaults",
+                n, mae_new, mae_type
+            );
+        }
+        inference_report = Some(report);
+    }
+
     // Soft-knee compression of outlier-tall buildings.
     // Building height scaling is linear, so a real 100 m+ landmark (St Peter's,
     // Asinelli Tower) towers absurdly over a 10 m city. Buildings up to a
@@ -295,7 +316,14 @@ pub async fn generate_terrain(
             - y_vals.iter().cloned().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
         (x_range.max(y_range) as f32).max(1.0)
     };
-    let elevation_range = (elev_max - elev_min).max(1.0_f32);
+    // Robust relief (p1–p99): single DEM pits/spikes (Modena has an 8 m
+    // outlier pit) must not decide the exaggeration of the whole scene.
+    let elevation_range = {
+        let mut z: Vec<f32> = elevation_points.iter().map(|p| p.elevation).collect();
+        z.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let q = |p: f32| z[((z.len() - 1) as f32 * p).round() as usize];
+        (q(0.99) - q(0.01)).max(1.0_f32)
+    };
 
     // mm per real metre after normalization (matches normalize_to_print_size).
     let mm_per_m = print_size_mm / xy_range_m;
@@ -326,25 +354,57 @@ pub async fn generate_terrain(
     };
     target_terrain_mm = target_terrain_mm.clamp(0.0, max_terrain_mm);
 
-    let effective_terrain_scale = if relief_m > 0.5 {
+    let mut effective_terrain_scale = if relief_m > 0.5 {
         target_terrain_mm / (relief_m * mm_per_m)
     } else {
         0.0
     };
 
-    // Buildings: a REFERENCE_BUILDING_M building reaches target_building_mm at vs=2,
-    // independent of area size. height_mm = height_m × scale × mm_per_m.
-    const REFERENCE_BUILDING_M: f32 = 15.0;
-    const TARGET_BUILDING_MM_PER_VS: f32 = 6.0; // → 12mm at vs=2 for a 15m building
-    let target_building_mm = TARGET_BUILDING_MM_PER_VS * vertical_scale;
-    let effective_building_scale = target_building_mm / (REFERENCE_BUILDING_M * mm_per_m);
+    // Buildings: ONE bounded exaggeration of the true XY scale, so buildings
+    // keep the proportions of the plan. The old model pinned a 15 m building
+    // to 12 mm on every area (6× on 1.8 km² Modena, 16× on 11 km² Bologna,
+    // 22× on 19 km²): the
+    // city printed as a field of needles. Now the scene's typical building
+    // reaches TARGET_TYPICAL_BUILDING_MM at vs=2, exaggerating by at least 1×
+    // (never below true scale) and at most MAX_BUILDING_EXAGGERATION.
+    const TARGET_TYPICAL_BUILDING_MM: f32 = 2.0;
+    const MAX_BUILDING_EXAGGERATION: f32 = 3.0;
+    const FALLBACK_TYPICAL_BUILDING_M: f32 = 12.0;
+    let typical_building_m = {
+        let mut h: Vec<f32> = buildings.iter().filter(|b| !b.is_part).map(|b| b.height).collect();
+        h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        h.get(h.len() / 2).copied().unwrap_or(FALLBACK_TYPICAL_BUILDING_M).max(3.0)
+    };
+    let auto_building_scale = (TARGET_TYPICAL_BUILDING_MM / (typical_building_m * mm_per_m))
+        .clamp(1.0, MAX_BUILDING_EXAGGERATION);
+    // vertical_scale stays neutral at 2.0 (the frontend default).
+    let effective_building_scale = auto_building_scale * (vertical_scale / 2.0);
+
+    // In cities terrain is never exaggerated more than the buildings standing
+    // on it — otherwise DEM bumps (often building mass baked into the DEM)
+    // turn into hills the city sits on.
+    if scene_mode == "urban" {
+        effective_terrain_scale = effective_terrain_scale.min(effective_building_scale);
+        target_terrain_mm = relief_m * mm_per_m * effective_terrain_scale;
+    }
+
+    // Smallest printed wall height of a ground-level building (mesh Z units
+    // are metres × scale before normalisation, i.e. mm / mm_per_m).
+    const MIN_BUILDING_PRINT_MM: f32 = 0.6;
+    let min_building_z = MIN_BUILDING_PRINT_MM / mm_per_m;
 
     tracing::info!("─────────────────────────────────────────────────────────────────");
     tracing::info!("📐 Scaling model ({} scene):", scene_mode);
     tracing::info!("   ├─ XY extent:        {:.1} m  (→ {:.1}mm print, {:.4} mm/m)", xy_range_m, print_size_mm, mm_per_m);
-    tracing::info!("   ├─ Relief:           {:.1} m", relief_m);
+    tracing::info!("   ├─ Relief (p1–p99):  {:.1} m", relief_m);
     tracing::info!("   ├─ Terrain target:   {:.1} mm  (scale {:.2}x)", target_terrain_mm, effective_terrain_scale);
-    tracing::info!("   └─ Building target:  {:.1} mm for {:.0}m ref  (scale {:.2}x)", target_building_mm, REFERENCE_BUILDING_M, effective_building_scale);
+    tracing::info!(
+        "   └─ Buildings:        typical {:.1} m → {:.2} mm  (scale {:.2}x, auto {:.2}x)",
+        typical_building_m,
+        typical_building_m * effective_building_scale * mm_per_m,
+        effective_building_scale,
+        auto_building_scale
+    );
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 6: Generate 3D terrain mesh using Delaunay triangulation
@@ -354,7 +414,13 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Using Delaunay triangulation to create triangle mesh from elevation points");
     let step_start = std::time::Instant::now();
 
-    let mesh_generator = MeshGenerator::new(projector, effective_terrain_scale, effective_building_scale, base_height);
+    let mesh_generator = MeshGenerator::new(
+        projector,
+        effective_terrain_scale,
+        effective_building_scale,
+        min_building_z,
+        base_height,
+    );
     let mut mesh = mesh_generator.generate_terrain_mesh(&projected_points)
         .map_err(|e| {
             tracing::error!("   ✗ FAILED to generate terrain mesh: {}", e);
@@ -457,6 +523,7 @@ pub async fn generate_terrain(
     write_geometry_report(
         &request.bbox,
         &buildings,
+        inference_report.as_ref(),
         &placements,
         &mesh,
         terrain_triangle_count,
@@ -522,6 +589,7 @@ pub async fn generate_terrain(
 fn write_geometry_report(
     bbox: &BoundingBox,
     buildings: &[Building],
+    inference: Option<&crate::services::height_inference::InferenceReport>,
     placements: &[crate::utils::mesh::BuildingPlacement],
     mesh: &TerrainMesh,
     terrain_triangles: usize,
@@ -531,8 +599,10 @@ fn write_geometry_report(
     use std::collections::BTreeMap;
 
     let mut roof_shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut height_sources: BTreeMap<&'static str, usize> = BTreeMap::new();
     for b in buildings {
         *roof_shapes.entry(b.roof_shape.name()).or_insert(0) += 1;
+        *height_sources.entry(b.height_source.name()).or_insert(0) += 1;
     }
 
     // placements is index-aligned with buildings (one record per input element).
@@ -540,7 +610,9 @@ fn write_geometry_report(
         let mut v = serde_json::json!({
             "id": b.id,
             "is_part": b.is_part,
+            "kind": b.kind,
             "height_m": b.height,
+            "height_source": b.height_source.name(),
             "min_height_m": b.min_height,
             "roof": b.roof_shape.name(),
             "roof_height_m": b.roof_height,
@@ -574,6 +646,16 @@ fn write_geometry_report(
             "with_courtyards": buildings.iter().filter(|b| !b.holes.is_empty()).count(),
             "with_min_height": buildings.iter().filter(|b| b.min_height > 0.0).count(),
             "roof_shapes": roof_shapes,
+            "height_sources": height_sources,
+            "inference": inference.map(|r| serde_json::json!({
+                "inferred": r.inferred,
+                "blocks": r.blocks,
+                "loo": r.loo.map(|(n, mae_new, mae_type)| serde_json::json!({
+                    "samples": n,
+                    "mae_m": mae_new,
+                    "mae_type_default_m": mae_type,
+                })),
+            })),
         },
         "mesh": {
             "vertices": mesh.vertices.len(),

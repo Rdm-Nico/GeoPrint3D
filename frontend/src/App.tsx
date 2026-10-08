@@ -120,7 +120,7 @@ export default function App() {
 
                 <div>
                   <label className="block text-xs font-medium text-gray-700 mb-1">
-                    Vertical Exaggeration: {verticalScale}x (1x = ~15% height)
+                    Vertical Exaggeration: {verticalScale}x (2x = balanced, auto-scaled to area)
                   </label>
                   <input
                     type="range"

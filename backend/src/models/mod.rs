@@ -116,6 +116,37 @@ impl RoofShape {
     }
 }
 
+/// Where a building's `height` came from. Tag/Levels are measured OSM data;
+/// Block/Neighbors/Density are contextual estimates (services::height_inference);
+/// TypeDefault is the plain per-type fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HeightSource {
+    Tag,
+    Levels,
+    Block,
+    Neighbors,
+    Density,
+    TypeDefault,
+}
+
+impl HeightSource {
+    /// True for heights backed by OSM data (usable as evidence for neighbours).
+    pub fn is_measured(&self) -> bool {
+        matches!(self, HeightSource::Tag | HeightSource::Levels)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            HeightSource::Tag => "tag",
+            HeightSource::Levels => "levels",
+            HeightSource::Block => "block",
+            HeightSource::Neighbors => "neighbors",
+            HeightSource::Density => "density",
+            HeightSource::TypeDefault => "type_default",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Building {
     pub id: u64,                          // OSM element id (way or relation)
@@ -126,6 +157,8 @@ pub struct Building {
     pub roof_shape: RoofShape,
     pub roof_height: f32,                 // meters of `height` taken by the roof; 0 = auto
     pub is_part: bool,                    // true for building:part elements
+    pub kind: String,                     // `building=` (or `building:part=`) value
+    pub height_source: HeightSource,
 }
 
 #[derive(Debug)]

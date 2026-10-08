@@ -331,9 +331,12 @@ pub struct MeshGenerator {
     /// Applied only to terrain elevation. Computed adaptively in the handler so that
     /// terrain relief always reaches a visible fraction of the print width.
     terrain_scale: f32,
-    /// Applied to building heights. Equal to the user's vertical_scale preference
-    /// so buildings stay proportional to what the user expects.
+    /// Applied to building heights: a bounded exaggeration of the true XY
+    /// scale, computed in the handler from the scene's typical building.
     building_scale: f32,
+    /// Smallest wall height (mesh Z units) of a ground-level building outline,
+    /// so tiny structures don't vanish into the terrain on large-area prints.
+    min_building_height: f32,
     base_height: f32,
 }
 
@@ -342,12 +345,14 @@ impl MeshGenerator {
         projector: CoordinateProjector,
         terrain_scale: f32,
         building_scale: f32,
+        min_building_height: f32,
         base_height: f32,
     ) -> Self {
         Self {
             projector,
             terrain_scale,
             building_scale,
+            min_building_height,
             base_height,
         }
     }
@@ -674,7 +679,12 @@ impl MeshGenerator {
         // building_scale is independent of terrain_scale so that building heights
         // stay proportional to reality even when terrain is heavily exaggerated.
         let bottom_z = base_elevation + building.min_height * self.building_scale;
-        let top_z = base_elevation + building.height * self.building_scale;
+        let mut top_z = base_elevation + building.height * self.building_scale;
+        // Printability floor for ground-level outlines only: building:part
+        // solids stack on each other's heights and must keep the shared mapping.
+        if !building.is_part && building.min_height < 0.5 {
+            top_z = top_z.max(bottom_z + self.min_building_height);
+        }
         if top_z - bottom_z < 1e-3 {
             anyhow::bail!("zero-height solid");
         }

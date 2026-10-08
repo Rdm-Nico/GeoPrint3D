@@ -123,7 +123,8 @@ backend/src/
 ├── services/
 │   ├── mod.rs
 │   ├── elevation.rs    // Fetch elevation data
-│   └── osm.rs          // Fetch OSM buildings
+│   ├── osm.rs          // Fetch OSM buildings
+│   └── height_inference.rs // Estimate missing building heights
 └── utils/
     ├── mod.rs
     ├── projection.rs   // Coordinate transformation
@@ -168,6 +169,60 @@ MeshGenerator::close_mesh_with_base(mesh)
   4. Generate bottom face (flipped triangles)
   5. Connect perimeter with walls (TODO: proper edge detection)
 ```
+
+#### Building Heights
+Over 90% of OSM buildings in a typical Italian city carry no `height` or
+`building:levels` tag, so most heights must be estimated. The pipeline has
+three stages:
+
+```
+1. Tags (services/osm.rs)
+   height / est_height → building:levels × 3.2 m (+ roof:levels) → per-type default
+
+2. Contextual inference (services/height_inference.rs)
+   Only for outlines that fell back to the per-type default and have a
+   generic type (yes, residential, apartments, commercial, house, …):
+     a. Density prior: built-up ratio ρ in a 100 m disk → storeys
+        interpolated in a per-type range (generic 2.5–5, apartments 3.5–6),
+        sparse at ρ ≤ 0.10, dense core at ρ ≥ 0.60
+     b. Tagged neighbours within 150 m (≥ 3 samples): IDW-weighted median,
+        blended with the prior as (n·h_nbr + 3·h_prior) / (n + 3)
+     c. Block harmonisation: outlines that share OSM nodes (terraced
+        fabric / isolati) take the area-weighted median of their block
+        within 60 m, pulled toward any tagged block members
+     d. ±4% deterministic jitter per OSM id
+   A leave-one-out check on tagged buildings is logged on every run
+   (Bologna: MAE 6.7 m with type defaults → 5.2 m).
+
+3. Print scaling (api/handlers.rs)
+   Tall landmarks above a knee (3 × median height, at least 20 m) are
+   soft-compressed. Then one bounded vertical exaggeration is applied to all
+   buildings: the scene's median building prints at ~2 mm (vertical_scale = 2),
+   exaggeration clamped to 1–3× of the true XY scale. In urban scenes terrain
+   is never exaggerated more than the buildings. Ground-level outlines print
+   at least 0.6 mm tall.
+```
+
+Garages, churches, towers, industrial buildings and `building:part` elements
+keep their tagged or per-type heights.
+
+The approach follows the urban-form literature on predicting building heights
+from 2D data:
+
+- F. Biljecki, H. Ledoux, J. Stoter (2017), *Generating 3D city models without
+  elevation data*, Computers, Environment and Urban Systems 64.
+  [link](https://3d.bk.tudelft.nl/news/2017/01/17/inferring-heights-ceus-paper.html)
+- N. Milojevic-Dupont et al. (2020), *Learning from urban form to predict
+  building heights*, PLOS ONE.
+  [link](https://depositonce.tu-berlin.de/items/6a651826-232d-4e7b-9ecb-fceeb025e432/full)
+
+Candidate external height sources for a future phase:
+
+- X. X. Zhu et al. (2025), *GlobalBuildingAtlas: an open global and complete
+  dataset of building polygons, heights and LoD1 3D models*, Earth System
+  Science Data 17. [link](https://essd.copernicus.org/articles/17/6647/2025/)
+- EUBUCCO (Milojevic-Dupont et al. 2023, Scientific Data): EU building stock
+  with heights. [link](https://ual.sg/publication/2023-sd-eubucco/)
 
 #### Manifold Validation
 ```rust
