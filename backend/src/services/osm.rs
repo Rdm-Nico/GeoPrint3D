@@ -3,7 +3,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -45,8 +45,37 @@ struct HeightSources {
 struct FetchStats {
     src: HeightSources,
     relations: usize,
-    /// Water elements dropped (underground / culverted / open rings).
+    /// Water elements dropped (underground / culverted / incomplete rings).
     water_skipped: usize,
+    /// Water relations whose members came back incomplete from their tile.
+    /// They are re-fetched whole after the merge (see `fetch_features`).
+    pending: Vec<PendingRelation>,
+}
+
+/// A water relation waiting for a complete copy.
+struct PendingRelation {
+    id: u64,
+    class: ElementClass,
+    tags: Value,
+}
+
+/// One multipolygon relation's member segments, split by role.
+struct Members {
+    outer: Vec<Vec<(f64, f64)>>,
+    inner: Vec<Vec<(f64, f64)>>,
+    /// Way members the response carried without usable geometry.
+    missing: usize,
+}
+
+/// How complete a water relation must be before it is emitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// A tile copy: a missing member or an open ring defers the relation to
+    /// the whole-relation fetch.
+    Strict,
+    /// A whole copy: every member is present, so an open ring is broken OSM
+    /// data. Its closed rings are kept and the open chains are reported.
+    Lenient,
 }
 
 /// Which feature classes one fetch asks OSM for. Buildings and water travel
@@ -98,6 +127,10 @@ const OSM_PHASE_BUDGET: Duration = Duration::from_secs(90);
 
 // A failed tile is only split-and-retried when at least this much budget is left.
 const MIN_SPLIT_BUDGET: Duration = Duration::from_secs(10);
+
+// Window for re-fetching incomplete water relations whole. It runs after the
+// tile phase, so it has its own budget rather than sharing the phase deadline.
+const RELATION_FALLBACK_BUDGET: Duration = Duration::from_secs(15);
 
 /// Split a bbox into an `nx` × `ny` grid.
 fn split_bbox_grid(bbox: &BoundingBox, nx: usize, ny: usize) -> Vec<BoundingBox> {
@@ -352,6 +385,40 @@ impl OsmService {
             );
         }
 
+        // ── Incomplete water relations ────────────────────────────────────────
+        // A large lake or lagoon can arrive with members cut by a tile edge (the
+        // OSM direct API omits members outside the tile). Such a relation is
+        // re-fetched whole; relations already complete from another tile are
+        // skipped, so a partial copy never shadows a full one.
+        let mut wanted: BTreeMap<u64, PendingRelation> = BTreeMap::new();
+        for p in std::mem::take(&mut stats.pending) {
+            if !seen.contains(&(true, p.id)) {
+                wanted.entry(p.id).or_insert(p);
+            }
+        }
+        if !wanted.is_empty() {
+            tracing::info!("   │  ↻ {} incomplete water relation(s) — fetching whole", wanted.len());
+            let ids: Vec<u64> = wanted.keys().copied().collect();
+            let deadline = Instant::now() + RELATION_FALLBACK_BUDGET;
+            let fetched = fetch_full_relations(&self.client, ids, deadline).await;
+            let mut ctx = ParseCtx { bbox, min_area_m2, opts, seen: &mut seen, out: &mut out, stats: &mut stats };
+            for (id, data) in fetched {
+                match data {
+                    Ok(v) => recover_relation(&mut ctx, &wanted[&id], &v),
+                    Err(e) => tracing::warn!("   │  Relation {} fetch FAILED: {:#}", id, e),
+                }
+            }
+            for (id, p) in &wanted {
+                if !seen.contains(&(true, *id)) {
+                    stats.water_skipped += 1;
+                    tracing::warn!(
+                        "   │  ⚠ water relation {} ({}) still incomplete — dropped",
+                        id, p.tags["name"].as_str().unwrap_or("unnamed")
+                    );
+                }
+            }
+        }
+
         let mut buildings = std::mem::take(&mut out.buildings);
         if opts.buildings {
             let suppressed = suppress_covered_outlines(&mut buildings);
@@ -468,12 +535,6 @@ fn parse_geom_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
 
     tracing::debug!("   │  Parsing {} OSM elements", elements.len());
 
-    let coords_of = |geom: &Vec<Value>| -> Vec<(f64, f64)> {
-        geom.iter()
-            .filter_map(|g| Some((g["lon"].as_f64()?, g["lat"].as_f64()?)))
-            .collect()
-    };
-
     for el in elements.iter() {
         let tags = &el["tags"];
         let id = el["id"].as_u64().unwrap_or(0);
@@ -491,36 +552,23 @@ fn parse_geom_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
                     ctx.stats.src.skipped += 1;
                     continue;
                 };
-                push_way(ctx, class, id, coords_of(geometry), tags);
+                push_way(ctx, class, id, geom_coords(geometry), tags);
             }
             "relation" => {
                 let class = classify_element(tags, true, ctx.opts);
                 if class == ElementClass::Skip {
                     continue;
                 }
-                if !ctx.seen.insert((true, id)) {
+                if ctx.seen.contains(&(true, id)) {
                     continue;
                 }
                 let Some(members) = el["members"].as_array() else {
                     continue;
                 };
-                let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                for m in members {
-                    let Some(geom) = m["geometry"].as_array() else {
-                        continue;
-                    };
-                    let line = coords_of(geom);
-                    if line.len() < 2 {
-                        continue;
-                    }
-                    if m["role"].as_str() == Some("inner") {
-                        inner_segments.push(line);
-                    } else {
-                        outer_segments.push(line);
-                    }
+                let rel = geom_members(members);
+                if !push_multipolygon(ctx, class, id, rel, tags, Gate::Strict) {
+                    ctx.stats.pending.push(PendingRelation { id, class, tags: tags.clone() });
                 }
-                push_multipolygon(ctx, class, id, outer_segments, inner_segments, tags);
             }
             _ => {}
         }
@@ -542,35 +590,7 @@ fn parse_noderefs_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
 
     tracing::debug!("   │  Parsing {} total OSM elements", elements.len());
 
-    // Build node-id → (lon, lat) map
-    let mut nodes: HashMap<u64, (f64, f64)> = HashMap::new();
-    for el in elements.iter() {
-        if el["type"] == "node" {
-            if let (Some(id), Some(lat), Some(lon)) =
-                (el["id"].as_u64(), el["lat"].as_f64(), el["lon"].as_f64())
-            {
-                nodes.insert(id, (lon, lat));
-            }
-        }
-    }
-
-    // Build way-id → coordinate-list map (all ways: multipolygon members
-    // usually carry no building tag themselves).
-    let mut ways: HashMap<u64, Vec<(f64, f64)>> = HashMap::new();
-    for el in elements.iter() {
-        if el["type"] != "way" {
-            continue;
-        }
-        let (Some(id), Some(node_refs)) = (el["id"].as_u64(), el["nodes"].as_array()) else {
-            continue;
-        };
-        let coords: Vec<(f64, f64)> = node_refs
-            .iter()
-            .filter_map(|r| r.as_u64())
-            .filter_map(|nid| nodes.get(&nid).copied())
-            .collect();
-        ways.insert(id, coords);
-    }
+    let ways = way_coords_from_noderefs(elements);
 
     for el in elements.iter() {
         let tags = &el["tags"];
@@ -597,37 +617,93 @@ fn parse_noderefs_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
                 if class == ElementClass::Skip {
                     continue;
                 }
-                if !ctx.seen.insert((true, id)) {
+                if ctx.seen.contains(&(true, id)) {
                     continue;
                 }
                 let Some(members) = el["members"].as_array() else {
                     continue;
                 };
-                let mut outer_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                let mut inner_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-                for m in members {
-                    if m["type"] != "way" {
-                        continue;
-                    }
-                    let Some(coords) = m["ref"].as_u64().and_then(|r| ways.get(&r)).cloned() else {
-                        continue;
-                    };
-                    if coords.len() < 2 {
-                        continue;
-                    }
-                    if m["role"].as_str() == Some("inner") {
-                        inner_segments.push(coords);
-                    } else {
-                        outer_segments.push(coords);
-                    }
+                let rel = noderef_members(members, &ways);
+                if !push_multipolygon(ctx, class, id, rel, tags, Gate::Strict) {
+                    ctx.stats.pending.push(PendingRelation { id, class, tags: tags.clone() });
                 }
-                push_multipolygon(ctx, class, id, outer_segments, inner_segments, tags);
             }
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Coordinates of an Overpass `out geom` geometry array.
+fn geom_coords(geom: &[Value]) -> Vec<(f64, f64)> {
+    geom.iter()
+        .filter_map(|g| Some((g["lon"].as_f64()?, g["lat"].as_f64()?)))
+        .collect()
+}
+
+/// Member segments of an Overpass relation, split by role.
+fn geom_members(members: &[Value]) -> Members {
+    let mut out = Members { outer: Vec::new(), inner: Vec::new(), missing: 0 };
+    for m in members.iter().filter(|m| m["type"] == "way") {
+        let line = m["geometry"].as_array().map(|g| geom_coords(g)).unwrap_or_default();
+        if line.len() < 2 {
+            out.missing += 1;
+        } else if m["role"].as_str() == Some("inner") {
+            out.inner.push(line);
+        } else {
+            out.outer.push(line);
+        }
+    }
+    out
+}
+
+/// Way coordinates of an OSM direct API response (node-ref format), keyed by
+/// way id. Nodes missing from the response are dropped from their way.
+fn way_coords_from_noderefs(elements: &[Value]) -> HashMap<u64, Vec<(f64, f64)>> {
+    // Build node-id → (lon, lat) map
+    let mut nodes: HashMap<u64, (f64, f64)> = HashMap::new();
+    for el in elements.iter() {
+        if el["type"] == "node" {
+            if let (Some(id), Some(lat), Some(lon)) =
+                (el["id"].as_u64(), el["lat"].as_f64(), el["lon"].as_f64())
+            {
+                nodes.insert(id, (lon, lat));
+            }
+        }
+    }
+
+    // All ways: multipolygon members usually carry no building tag themselves.
+    let mut ways: HashMap<u64, Vec<(f64, f64)>> = HashMap::new();
+    for el in elements.iter() {
+        if el["type"] != "way" {
+            continue;
+        }
+        let (Some(id), Some(node_refs)) = (el["id"].as_u64(), el["nodes"].as_array()) else {
+            continue;
+        };
+        let coords: Vec<(f64, f64)> = node_refs
+            .iter()
+            .filter_map(|r| r.as_u64())
+            .filter_map(|nid| nodes.get(&nid).copied())
+            .collect();
+        ways.insert(id, coords);
+    }
+    ways
+}
+
+/// Member segments of a node-ref relation, split by role. A way whose
+/// geometry is absent from the response counts as missing.
+fn noderef_members(members: &[Value], ways: &HashMap<u64, Vec<(f64, f64)>>) -> Members {
+    let mut out = Members { outer: Vec::new(), inner: Vec::new(), missing: 0 };
+    for m in members.iter().filter(|m| m["type"] == "way") {
+        match m["ref"].as_u64().and_then(|r| ways.get(&r)).filter(|c| c.len() >= 2) {
+            None => out.missing += 1,
+            Some(coords) if m["role"].as_str() == Some("inner") => out.inner.push(coords.clone()),
+            Some(coords) => out.outer.push(coords.clone()),
+        }
+    }
+    out
 }
 
 /// Dispatch one parsed way by class.
@@ -667,28 +743,43 @@ fn push_way(ctx: &mut ParseCtx, class: ElementClass, id: u64, coords: Vec<(f64, 
     }
 }
 
-/// Dispatch one parsed multipolygon relation by class.
-fn push_multipolygon(
-    ctx: &mut ParseCtx,
-    class: ElementClass,
-    id: u64,
-    outer_segments: Vec<Vec<(f64, f64)>>,
-    inner_segments: Vec<Vec<(f64, f64)>>,
-    tags: &Value,
-) {
+/// Dispatch one parsed multipolygon relation by class. Returns `false` when a
+/// water relation is incomplete under `gate`: nothing is emitted and the id is
+/// NOT marked seen, so a complete copy from another tile or the fallback fetch
+/// can still land. Buildings always return `true`.
+fn push_multipolygon(ctx: &mut ParseCtx, class: ElementClass, id: u64, rel: Members, tags: &Value, gate: Gate) -> bool {
     match class {
         ElementClass::Building => {
+            ctx.seen.insert((true, id));
             ctx.stats.relations += 1;
             push_relation(
-                &mut ctx.out.buildings, id, outer_segments, inner_segments, tags,
+                &mut ctx.out.buildings, id, rel.outer, rel.inner, tags,
                 ctx.bbox, ctx.min_area_m2, &mut ctx.stats.src,
             );
+            true
         }
         ElementClass::WaterArea(kind) => {
+            let (outer_rings, open_outer) = assemble_rings_checked(rel.outer);
+            let (inner_rings, open_inner) = assemble_rings_checked(rel.inner);
+            let open = open_outer + open_inner;
+            let incomplete = match gate {
+                // A missing or open hole would turn land into water, and a
+                // missing outer loses a lake: neither is trusted from a tile.
+                Gate::Strict => rel.missing + open > 0,
+                Gate::Lenient => rel.missing > 0,
+            };
+            if incomplete {
+                return false;
+            }
+            if open > 0 {
+                tracing::warn!(
+                    "   │  ⚠ water relation {} has {} open ring chain(s) with all members present — closed rings kept",
+                    id, open
+                );
+            }
+            ctx.seen.insert((true, id));
             // No bbox clipping here: hydro clips in metres against the
             // terrain hull, and a lake's shore outside the bbox is irrelevant.
-            let outer_rings = assemble_rings(outer_segments);
-            let inner_rings = assemble_rings(inner_segments);
             if outer_rings.is_empty() {
                 ctx.stats.water_skipped += 1;
             }
@@ -700,8 +791,82 @@ fn push_multipolygon(
                     .collect();
                 ctx.out.water.areas.push(WaterArea { id, kind, outer, holes });
             }
+            true
         }
-        _ => {}
+        _ => true,
+    }
+}
+
+/// Fetch whole relations (their member ways and nodes included) from the OSM
+/// API, concurrently. Results come back sorted by id; a panicked task drops
+/// its id silently and the caller reports it as dropped.
+async fn fetch_full_relations(
+    client: &reqwest::Client,
+    ids: Vec<u64>,
+    deadline: Instant,
+) -> Vec<(u64, Result<Value>)> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TILES));
+    let mut tasks: JoinSet<(u64, Result<Value>)> = JoinSet::new();
+    for id in ids {
+        let client = client.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            (id, fetch_full_relation(&client, id, deadline).await)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(r) = joined {
+            results.push(r);
+        }
+    }
+    results.sort_by_key(|(id, _)| *id);
+    results
+}
+
+/// One `relation/{id}/full` request, clamped to the fallback window.
+async fn fetch_full_relation(client: &reqwest::Client, id: u64, deadline: Instant) -> Result<Value> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("relation fetch budget exhausted")?;
+    let url = format!("https://api.openstreetmap.org/api/0.6/relation/{id}/full.json");
+    let resp = client
+        .get(&url)
+        .timeout(ATTEMPT_TIMEOUT.min(remaining))
+        .send()
+        .await
+        .context("OSM API: relation request failed")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("OSM API: HTTP {}", resp.status());
+    }
+    resp.json().await.context("OSM API: invalid relation JSON")
+}
+
+/// Apply a re-fetched water relation. Only the relation element itself is
+/// read: its members resolve against the response's own ways and nodes, then
+/// the relation goes through the same gate as the tile copies. A relation still
+/// incomplete here is left out (the caller reports it).
+fn recover_relation(ctx: &mut ParseCtx, pending: &PendingRelation, data: &Value) {
+    let Some(elements) = data["elements"].as_array() else {
+        return;
+    };
+    let Some(rel) = elements
+        .iter()
+        .find(|e| e["type"] == "relation" && e["id"].as_u64() == Some(pending.id))
+    else {
+        return;
+    };
+    let ways = way_coords_from_noderefs(elements);
+    let no_members = Vec::new();
+    let members = rel["members"].as_array().unwrap_or(&no_members);
+    let rel_members = noderef_members(members, &ways);
+    if push_multipolygon(ctx, pending.class, pending.id, rel_members, &pending.tags, Gate::Lenient) {
+        tracing::info!(
+            "   │  ↻ water relation {} ({}) recovered whole",
+            pending.id,
+            pending.tags["name"].as_str().unwrap_or("unnamed")
+        );
     }
 }
 
@@ -1024,12 +1189,18 @@ fn push_relation(
 /// Stitch way segments into closed rings by matching endpoints.
 /// Multipolygon outlines are routinely split across several ways (e.g. each
 /// colonnade crescent is its own way); unclosed leftovers are dropped.
-fn assemble_rings(mut segments: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
+fn assemble_rings(segments: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
+    assemble_rings_checked(segments).0
+}
+
+/// `assemble_rings` plus the number of open chains it had to drop.
+fn assemble_rings_checked(mut segments: Vec<Vec<(f64, f64)>>) -> (Vec<Vec<(f64, f64)>>, usize) {
     // OSM members share exact node coordinates, so a tiny epsilon suffices.
     const EPS: f64 = 1e-9;
     let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < EPS && (a.1 - b.1).abs() < EPS;
 
     let mut rings = Vec::new();
+    let mut open = 0usize;
     while let Some(mut current) = segments.pop() {
         loop {
             let first = current[0];
@@ -1059,11 +1230,14 @@ fn assemble_rings(mut segments: Vec<Vec<(f64, f64)>>) -> Vec<Vec<(f64, f64)>> {
                     }
                     current.extend(seg.into_iter().skip(1));
                 }
-                None => break, // open ring — incomplete data, drop it
+                None => {
+                    open += 1; // open ring — incomplete data, drop it
+                    break;
+                }
             }
         }
     }
-    rings
+    (rings, open)
 }
 
 /// Ray-casting point-in-polygon test (lon/lat treated as planar — fine at city scale).
@@ -1491,5 +1665,126 @@ mod tests {
             elements.push(json!({"type": "way", "id": id, "tags": tags, "nodes": refs}));
         }
         check(&parse(json!({ "elements": elements }), true));
+    }
+
+    fn members(outer: Vec<Vec<(f64, f64)>>, inner: Vec<Vec<(f64, f64)>>, missing: usize) -> Members {
+        Members { outer, inner, missing }
+    }
+
+    fn rect_ring(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<(f64, f64)> {
+        vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+    }
+
+    #[test]
+    fn open_chains_are_counted() {
+        let (rings, open) = assemble_rings_checked(vec![vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]]);
+        assert!(rings.is_empty());
+        assert_eq!(open, 1);
+        let (rings, open) = assemble_rings_checked(vec![rect_ring(0.0, 0.0, 1.0, 1.0)]);
+        assert_eq!((rings.len(), open), (1, 0));
+    }
+
+    #[test]
+    fn incomplete_water_relation_does_not_block_a_complete_copy() {
+        let b = bbox();
+        let (mut seen, mut out, mut stats) = (HashSet::new(), OsmFeatures::default(), FetchStats::default());
+        let mut ctx = ParseCtx {
+            bbox: &b,
+            min_area_m2: 0.0,
+            opts: FetchOptions { buildings: false, water: true },
+            seen: &mut seen,
+            out: &mut out,
+            stats: &mut stats,
+        };
+        let lake = ElementClass::WaterArea(WaterKind::Lake);
+        // Partial copy: one member missing → nothing emitted, id not seen.
+        assert!(!push_multipolygon(&mut ctx, lake, 7, members(vec![rect_ring(1.0, 1.0, 3.0, 3.0)], vec![], 1), &Value::Null, Gate::Strict));
+        assert!(!ctx.seen.contains(&(true, 7)));
+        assert!(ctx.out.water.areas.is_empty());
+        // Complete copy from another tile → accepted exactly once.
+        assert!(push_multipolygon(&mut ctx, lake, 7, members(vec![rect_ring(1.0, 1.0, 3.0, 3.0)], vec![], 0), &Value::Null, Gate::Strict));
+        assert!(ctx.seen.contains(&(true, 7)));
+        assert_eq!(ctx.out.water.areas.len(), 1);
+    }
+
+    #[test]
+    fn open_hole_is_deferred_in_tiles_but_kept_when_whole() {
+        let b = bbox();
+        let (mut seen, mut out, mut stats) = (HashSet::new(), OsmFeatures::default(), FetchStats::default());
+        let mut ctx = ParseCtx {
+            bbox: &b,
+            min_area_m2: 0.0,
+            opts: FetchOptions { buildings: false, water: true },
+            seen: &mut seen,
+            out: &mut out,
+            stats: &mut stats,
+        };
+        let open_hole = vec![(4.0, 4.0), (5.0, 4.0), (5.0, 5.0)];
+        let lake = ElementClass::WaterArea(WaterKind::Lake);
+        let rel = members(vec![rect_ring(0.0, 0.0, 9.0, 9.0)], vec![open_hole], 0);
+        assert!(!push_multipolygon(&mut ctx, lake, 8, rel, &Value::Null, Gate::Strict));
+        assert!(ctx.out.water.areas.is_empty());
+
+        // A whole copy with the same broken hole keeps the closed outer ring.
+        let rel = members(vec![rect_ring(0.0, 0.0, 9.0, 9.0)], vec![vec![(4.0, 4.0), (5.0, 4.0), (5.0, 5.0)]], 0);
+        assert!(push_multipolygon(&mut ctx, lake, 8, rel, &Value::Null, Gate::Lenient));
+        assert_eq!(ctx.out.water.areas.len(), 1);
+        assert!(ctx.out.water.areas[0].holes.is_empty());
+    }
+
+    #[test]
+    fn recovered_relation_is_read_from_full_response() {
+        // Relation 9 = square ring split over two ways; the response carries
+        // the relation's own nodes and ways, as `relation/9/full` does.
+        let data = json!({"elements": [
+            {"type": "node", "id": 1, "lat": 0.0, "lon": 0.0},
+            {"type": "node", "id": 2, "lat": 0.0, "lon": 5.0},
+            {"type": "node", "id": 3, "lat": 5.0, "lon": 5.0},
+            {"type": "node", "id": 4, "lat": 5.0, "lon": 0.0},
+            {"type": "way", "id": 11, "nodes": [1, 2, 3]},
+            {"type": "way", "id": 12, "nodes": [3, 4, 1]},
+            {"type": "relation", "id": 9, "tags": {"natural": "water", "name": "Test"},
+             "members": [
+                {"type": "way", "ref": 11, "role": "outer"},
+                {"type": "way", "ref": 12, "role": "outer"},
+             ]},
+        ]});
+        let pending = PendingRelation {
+            id: 9,
+            class: ElementClass::WaterArea(WaterKind::Lake),
+            tags: json!({"natural": "water", "name": "Test"}),
+        };
+        let b = BoundingBox { min_lat: -1.0, min_lon: -1.0, max_lat: 6.0, max_lon: 6.0 };
+        let (mut seen, mut out, mut stats) = (HashSet::new(), OsmFeatures::default(), FetchStats::default());
+        let mut ctx = ParseCtx {
+            bbox: &b,
+            min_area_m2: 0.0,
+            opts: FetchOptions { buildings: false, water: true },
+            seen: &mut seen,
+            out: &mut out,
+            stats: &mut stats,
+        };
+        recover_relation(&mut ctx, &pending, &data);
+        assert_eq!(ctx.out.water.areas.len(), 1);
+        assert_eq!(ctx.out.water.areas[0].outer.len(), 4);
+        assert!(ctx.seen.contains(&(true, 9)));
+
+        // Same response with a member way absent → still incomplete, not recovered.
+        let mut broken = data.clone();
+        broken["elements"].as_array_mut().unwrap().retain(|e| e["id"] != 12 || e["type"] != "way");
+        let mut seen2 = HashSet::new();
+        let mut out2 = OsmFeatures::default();
+        let mut stats2 = FetchStats::default();
+        let mut ctx2 = ParseCtx {
+            bbox: &b,
+            min_area_m2: 0.0,
+            opts: FetchOptions { buildings: false, water: true },
+            seen: &mut seen2,
+            out: &mut out2,
+            stats: &mut stats2,
+        };
+        recover_relation(&mut ctx2, &pending, &broken);
+        assert!(ctx2.out.water.areas.is_empty());
+        assert!(!ctx2.seen.contains(&(true, 9)));
     }
 }
