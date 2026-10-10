@@ -5,9 +5,22 @@ Ogni voce indica dove si trova il codice e che cosa è già stato verificato.
 
 ---
 
+## Efficienze da poter aggiungere:
+
+## Caching delle tails
+
+**sintomo**: se l'utente fa una rendering di una zona e poi ne fa un altro molto simile, attualemnte viene fatto un altro flusso completo che porta a ulteriore sforzo computazionale e ti tempo.
+**Idea** si potrebbe fare un caching del risultato ottenuto alla fine della generazione della mappa per tails. questi risultati vengono salvati per un tempo breve(5min) e vengono confrontati con le bbox che l'utente disegna:
+
+1. Con una sovrapposizione completa ed anzi un bbox più piccola di quella già fatta si può rimpicciolire semplicemente l'area da quel risultato e fornire quello in output.
+2. Se si ha una sovrapposizione laterale per una o più tile, si può ipotizzare di utilizzare la tile come risultato giá calcolato e fare il calcolo solo delle altri. In questo caso bisognerebbe capire se é fattibile fare un merging di questi due risultati realizzati in due momenti diversi ed se é facile tagliare così l'area.
+3. Se invece non é possibile fare una correlazione effettiva tra la nuova bbox dell'utente e quella cachata oppure il lavoro di divisione e unioni di più tails supera una certa soglia (tipo il 30% o di meno di sovrapposizione può portare a troppo lavoro rispetto a semplicemente rifare tutto il flusso).
+
+In ogni caso sarebbe da testare se si pùo fare perché al momento é solo un idea.
+
 ## Acqua (`feat/water`)
 
-### 1. Canali di Venezia a -2 m, laguna a 0 m  (aperto)
+### 1. Canali di Venezia a -2 m, laguna a 0 m (aperto)
 
 **Sintomo.** Con la Laguna di Venezia (relazione OSM 3049430) caricata, la rete
 di canali della città si posiziona a circa -2,04 m, mentre la laguna sta a
@@ -41,7 +54,7 @@ introdotto.
 
 **Opzioni da valutare.**
 
-- Usare il corpo *più grande* tra quelli toccati invece del minimo.
+- Usare il corpo _più grande_ tra quelli toccati invece del minimo.
 - Oppure alzare la soglia di affidabilità del corpo (oltre 12.400 m²).
 - Oppure, come regola più semplice, trattare `water=lagoon` come livello 0
   (la laguna è sempre a livello del mare).
@@ -50,7 +63,7 @@ introdotto.
 Log temporaneo che stampa i corpi toccati dal gruppo canali
 (`members > 100`). Criterio: canali e laguna entro ~0,1 m di livello.
 
-### 2. Export 3MF con tre livelli separati: acqua, edifici, terreno  (da fare)
+### 2. Export 3MF con tre livelli separati: acqua, edifici, terreno (da fare)
 
 **Obiettivo.** Esportare un file `.3mf` in cui acqua, edifici e terreno sono
 tre oggetti distinti, ciascuno con il proprio colore o materiale. Serve per
