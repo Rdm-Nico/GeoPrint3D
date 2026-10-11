@@ -13,6 +13,8 @@ export interface GenerateRequest {
   include_buildings?: boolean;
   print_size?: number;  // Largest XY print dimension in mm (default: 180)
   include_water?: boolean;  // Sea / lakes / rivers (default: true)
+  include_bridges?: boolean;  // Bridge decks, piers and towers (default: true)
+  bridge_print_supports?: boolean;  // Removable columns under long spans, assumes 0.2 mm layers (default: true)
 }
 
 export interface MeshStats {
@@ -23,6 +25,7 @@ export interface MeshStats {
   max_elevation: number;
   buildings_count: number;
   water_features_count?: number;
+  bridges_count?: number;
 }
 
 export interface MeshData {
@@ -31,6 +34,7 @@ export interface MeshData {
   terrain_triangle_count: number;        // triangles[0..this] are terrain (water included)
   building_triangle_count: number;       // triangles[terrain_tc..terrain_tc+this] are buildings
   water_triangle_count?: number;         // the LAST this-many terrain triangles are water surface
+  support_triangle_count?: number;       // triangles[terrain_tc+building_tc..+this] are removable print supports
 }
 
 export interface GenerateResponse {

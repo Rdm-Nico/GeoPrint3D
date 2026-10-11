@@ -64,17 +64,22 @@ function buildIndices(
   return arr;
 }
 
-// Renders the real terrain mesh split into three coloured layers:
+// Colour of the removable print supports (breakaway columns under bridge spans).
+const SUPPORT_COLOR = '#9ca3af';
+
+// Renders the real terrain mesh split into four coloured layers:
 //   - Terrain surface (incl. shore walls) → green
 //   - Water surface (last water_triangle_count terrain triangles) → light blue
-//   - Building extrusions → concrete grey
+//   - Building extrusions (bridge decks, piers and towers included) → concrete grey
+//   - Removable print supports (support_triangle_count after the buildings) → translucent grey
 function TerrainMesh({ meshData }: { meshData: MeshData }) {
-  const { terrainGeo, waterGeo, buildingGeo } = useMemo(() => {
+  const { terrainGeo, waterGeo, buildingGeo, supportGeo } = useMemo(() => {
     const { cx, cy, cz, scale } = computeTransform(meshData.vertices);
     const positions = buildPositions(meshData.vertices, cx, cy, cz, scale);
 
     const terrainTc = meshData.terrain_triangle_count;
     const buildingTc = meshData.building_triangle_count;
+    const supportTc = meshData.support_triangle_count ?? 0;
     // Older backends don't send the field: everything renders as terrain.
     const waterTc = Math.min(meshData.water_triangle_count ?? 0, terrainTc);
     const landTc = terrainTc - waterTc;
@@ -105,7 +110,19 @@ function TerrainMesh({ meshData }: { meshData: MeshData }) {
       bGeo.computeVertexNormals();
     }
 
-    return { terrainGeo: tGeo, waterGeo: wGeo, buildingGeo: bGeo };
+    // Removable support geometry (may be empty)
+    let sGeo: THREE.BufferGeometry | null = null;
+    if (supportTc > 0) {
+      const start = terrainTc + buildingTc;
+      sGeo = new THREE.BufferGeometry();
+      sGeo.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+      sGeo.setIndex(new THREE.BufferAttribute(
+        buildIndices(meshData.triangles, start, start + supportTc), 1
+      ));
+      sGeo.computeVertexNormals();
+    }
+
+    return { terrainGeo: tGeo, waterGeo: wGeo, buildingGeo: bGeo, supportGeo: sGeo };
   }, [meshData]);
 
   return (
@@ -138,6 +155,20 @@ function TerrainMesh({ meshData }: { meshData: MeshData }) {
             roughness={0.6}
             metalness={0.1}
             flatShading={true}
+            side={THREE.DoubleSide}
+          />
+        </mesh>
+      )}
+      {supportGeo && (
+        <mesh geometry={supportGeo}>
+          <meshStandardMaterial
+            color={SUPPORT_COLOR}
+            roughness={0.7}
+            metalness={0.0}
+            flatShading={true}
+            transparent={true}
+            opacity={0.45}
+            depthWrite={false}
             side={THREE.DoubleSide}
           />
         </mesh>
@@ -224,6 +255,9 @@ export default function Preview3D({ meshData, stats }: Preview3DProps) {
           {(stats.water_features_count ?? 0) > 0 && (
             <div>Water features: {stats.water_features_count?.toLocaleString()}</div>
           )}
+          {(stats.bridges_count ?? 0) > 0 && (
+            <div>Bridges: {stats.bridges_count?.toLocaleString()}</div>
+          )}
           <div>Elevation: {stats.min_elevation.toFixed(1)}m – {stats.max_elevation.toFixed(1)}m</div>
           <div>Area: {stats.area_km2.toFixed(4)} km²</div>
         </div>
@@ -243,6 +277,12 @@ export default function Preview3D({ meshData, stats }: Preview3DProps) {
           <span className="inline-block w-3 h-3 rounded-sm" style={{ background: DEFAULT_COLORS.water }} />
           <span>Water</span>
         </div>
+        {(meshData?.support_triangle_count ?? 0) > 0 && (
+          <div className="flex items-center gap-2">
+            <span className="inline-block w-3 h-3 rounded-sm opacity-60" style={{ background: SUPPORT_COLOR }} />
+            <span>Removable supports</span>
+          </div>
+        )}
         <div className="mt-2 pt-2 border-t border-gray-600 space-y-1">
           <div>Left drag: Rotate</div>
           <div>Right drag: Pan</div>

@@ -76,7 +76,10 @@ per intervalli di triangoli:
 
 - `triangles[0 .. terrain - water]` → terreno
 - `triangles[terrain - water .. terrain]` → acqua
-- `triangles[terrain .. terrain + buildings]` → edifici
+- `triangles[terrain .. terrain + buildings]` → edifici (impalcati, pile e
+  torri dei ponti compresi)
+- `triangles[terrain + buildings .. + supports]` → supporti removibili sotto
+  le campate dei ponti (`support_triangle_count`, `feat/bridges`)
 - il resto → base/pedestallo
 
 Il terreno è sempre prima dell'acqua e dei triangoli di base; vedi la
@@ -103,6 +106,64 @@ coincide con il mesh di origine entro tolleranza.
 
 ---
 
+## Ponti (`feat/bridges`)
+
+### 1. Export 3MF con support enforcer per le campate dei ponti (da fare)
+
+**Obiettivo.** Oggi le campate più lunghe di 10 mm stampati ricevono colonnine
+removibili integrate nella geometria (`BridgeBuild::emit_columns` in
+`backend/src/utils/bridges.rs`, range `support_triangle_count`). L'alternativa
+è non toccare la geometria e marcare nel 3MF le zone sotto gli impalcati come
+*support enforcer*: lo slicer genera i suoi supporti solo lì, con le
+impostazioni scelte dall'utente (interfaccia, Z-gap, pattern).
+
+**Perché non subito.**
+
+- Lo STL non porta metadati: senza 3MF non c'è modo di dire allo slicer dove
+  supportare.
+- PrusaSlicer, OrcaSlicer e Bambu Studio salvano enforcer e modificatori in
+  config 3MF proprietarie e incompatibili tra loro; Cura usa un meccanismo
+  ancora diverso (mesh di tipo "support mesh"). Servirebbe un writer per
+  slicer, o la scelta di uno solo.
+- In PrusaSlicer "Don't support bridges" è attivo di default e in passato
+  annullava gli enforcer proprio sotto una campata appoggiata su due torri.
+  In Orca gli enforcer hanno la precedenza. Il risultato dipende quindi dallo
+  slicer e dalla versione.
+- Le colonnine integrate funzionano ovunque, ma presuppongono layer da 0,2 mm
+  (top gap `BREAKAWAY_TOP_GAP_MM`).
+
+**Aggancio.** Si costruisce sopra il §2 dell'acqua (3MF a più oggetti): il
+range dei supporti diventa un oggetto a parte, oppure viene sostituito dai
+volumi enforcer.
+
+**Fonti.**
+[Prusa forum, Don't support bridges](https://forum.prusa3d.com/forum/prusaslicer/slicer-will-not-create-supports-where-they-are-needed),
+[enforcer ignorati](https://forum.prusa3d.com/forum/prusaslicer/support-enforcer-not-building-support/),
+[Orca: enforcer con precedenza](https://git.trueserve.org/PublicCodeMirror/OrcaSlicer-bambulab/commit/9f09f03228478aa77549efec845717b06e46cbc3),
+[3MF Orca/Bambu incompatibili](https://3dpros.com/slicers/orcaslicer).
+
+### 2. Cavi parametrici per i ponti sospesi (idea)
+
+I cavi principali e i pendini non sono mappati in OSM (né Golden Gate, né
+Brooklyn). Si potrebbero generare in modo parametrico tra le torri
+(`BridgeSupport` con ruolo Tower) e le spalle: catenaria dal top delle torri
+all'impalcato, spessore minimo stampabile 0,8 mm. Da valutare la
+stampabilità: un cavo inclinato e sottile è uno sbalzo, quindi servirebbe
+comunque un supporto.
+
+### 3. Arricchimento offline da Wikidata / NBI (idea)
+
+Solo il 2,6% dei `bridge:support` in OSM ha `height`. Wikidata e il National
+Bridge Inventory USA hanno altezze e luci, ma una chiamata live per render
+costa fino a 3,5 s ed eccede il budget OSM di 90 s. Se mai, va fatto offline
+(tabella precalcolata per id OSM). Attenzione: unità miste, la proprietà
+P2048 (altezza) è ambigua (impalcato o torre), P2793 è la luce libera sotto
+l'impalcato (clearance), non l'altezza.
+[Wikidata wbgetentities Q44440](https://www.wikidata.org/w/api.php?action=wbgetentities&ids=Q44440),
+[NBI FeatureServer](https://geo.dot.gov/server/rest/services/Hosted/National_Bridge_Inventory/FeatureServer/0).
+
+---
+
 ## Da verificare / note
 
 - **Mirror Overpass instabili.** Il 2026-10-08 i mirror rispondevano 500/429
@@ -114,6 +175,18 @@ coincide con il mesh di origine entro tolleranza.
   Da misurare su un'area grande.
 - **Oceano aperto.** Un bbox senza alcuna linea di costa viene trattato come
   terra. È un limite noto e accettato per ora.
+- **Schegge di terreno sul bordo bbox in mare aperto (trovato 2026-10-11).**
+  Golden Gate, bbox `37.8080,-122.4870 → 37.8340,-122.4680`, stampa 180 mm:
+  lungo il bordo ovest restano 117 triangoli "terra" larghi meno di 1 mm e
+  lunghi più di 20 mm (fino a tutto il lato, y 1 → 179 mm). Uno ha un vertice
+  a z ≈ 13 mm nell'angolo NW (colline di Marin) e gli altri a z = 0, quindi
+  formano un muro inclinato visibile in vista obliqua. Il terreno è identico
+  con `include_bridges=false` sullo stesso branch, quindi non dipende dai
+  ponti; non è ancora stato confrontato con `main`. Ipotesi: la fascia tra il
+  poligono del mare e il bordo della griglia viene triangolata come terra.
+  Ci sono anche 237 triangoli terra rivolti verso il basso: possibili pieghe
+  del terreno. Il controllo manifold conta solo i lati, quindi non le vede,
+  mentre uno slicer sì.
 - **Laguna come `Lake`.** La Laguna di Venezia è `natural=water` (non
   `natural=coastline`), quindi non è riconosciuta come mare. Il suo livello
   viene stimato dal DEM, che a Venezia è di tipo DSM. Collegato al punto 1.

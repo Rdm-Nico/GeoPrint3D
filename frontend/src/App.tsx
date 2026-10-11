@@ -32,6 +32,8 @@ export default function App() {
   const [printSize, setPrintSize] = useState(180);
   const [includeBuildings, setIncludeBuildings] = useState(true);
   const [includeWater, setIncludeWater] = useState(true);
+  const [includeBridges, setIncludeBridges] = useState(true);
+  const [bridgePrintSupports, setBridgePrintSupports] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
 
   const handleGenerate = async () => {
@@ -52,6 +54,8 @@ export default function App() {
         base_height: baseHeight,
         include_buildings: includeBuildings,
         include_water: includeWater,
+        include_bridges: includeBridges,
+        bridge_print_supports: bridgePrintSupports,
         print_size: printSize,
       });
 
@@ -188,6 +192,36 @@ export default function App() {
                     Include Water (sea, lakes, rivers)
                   </label>
                 </div>
+
+                <div className="flex items-center">
+                  <label className="flex items-center text-xs font-medium text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={includeBridges}
+                      onChange={(e) => setIncludeBridges(e.target.checked)}
+                      className="mr-2"
+                    />
+                    Include Bridges
+                  </label>
+                </div>
+
+                <div className="flex items-center">
+                  <label
+                    className={`flex items-center text-xs font-medium ${
+                      includeBridges ? 'text-gray-700' : 'text-gray-400'
+                    }`}
+                    title="Adds thin breakaway columns under bridge spans longer than 10 mm so the model prints without slicer supports. Columns stop 0.2 mm below the deck: slice with 0.2 mm layers and snap them off after printing."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={bridgePrintSupports}
+                      disabled={!includeBridges}
+                      onChange={(e) => setBridgePrintSupports(e.target.checked)}
+                      className="mr-2"
+                    />
+                    Removable supports for long bridge spans
+                  </label>
+                </div>
               </div>
             )}
 
@@ -274,6 +308,7 @@ export default function App() {
                   <div>Triangles: {result.stats.triangles.toLocaleString()}</div>
                   <div>Buildings: {result.stats.buildings_count}</div>
                   <div>Water features: {result.stats.water_features_count ?? 0}</div>
+                  <div>Bridges: {result.stats.bridges_count ?? 0}</div>
                   <div>Area: {result.stats.area_km2.toFixed(4)} km²</div>
                 </div>
               </div>

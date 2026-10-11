@@ -280,7 +280,11 @@ impl Piece {
 struct Group {
     pieces: Vec<usize>,
     outline_id: Option<u64>,
+    /// The outline's name, else the name covering the most deck length.
     name: Option<String>,
+    /// Every distinct deck name, longest total length first (a bridge joined
+    /// to its ramps or to an elevated road through a junction).
+    names: Vec<String>,
     length_m: f64,
     /// A mapped support lies on one of its decks: no default piers.
     mapped: bool,
@@ -509,6 +513,7 @@ impl BridgePlan {
                     pieces: Vec::new(),
                     outline_id: None,
                     name: None,
+                    names: Vec::new(),
                     length_m: 0.0,
                     mapped: false,
                     skip: None,
@@ -523,8 +528,21 @@ impl BridgePlan {
                     groups[g].name = outlines_m[oi].1.clone();
                 }
             }
-            if groups[g].name.is_none() {
-                groups[g].name = pieces[i].name.clone();
+        }
+        for g in groups.iter_mut() {
+            let mut by_len: Vec<(String, f64)> = Vec::new();
+            for &i in &g.pieces {
+                if let Some(n) = &pieces[i].name {
+                    match by_len.iter_mut().find(|(m, _)| m == n) {
+                        Some((_, l)) => *l += pieces[i].length,
+                        None => by_len.push((n.clone(), pieces[i].length)),
+                    }
+                }
+            }
+            by_len.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            g.names = by_len.into_iter().map(|(n, _)| n).collect();
+            if g.name.is_none() {
+                g.name = g.names.first().cloned();
             }
         }
 
@@ -965,6 +983,7 @@ impl BridgePlan {
                 "ways": g.pieces.iter().flat_map(|&i| self.pieces[i].way_ids.iter().copied()).collect::<Vec<_>>(),
                 "outline": g.outline_id,
                 "name": g.name,
+                "names": g.names,
                 "kind": self.pieces[main].kind.name(),
                 "layer": self.pieces[main].layer,
                 "structure": g.pieces.iter().find_map(|&i| self.pieces[i].structure.clone()),
@@ -1983,6 +2002,21 @@ mod tests {
         assert!((top[0].as_f64().unwrap() - abut[0].min(abut[1])).abs() < 1e-6, "no step at the abutment");
         assert_eq!(s.structures.1, 0);
         assert!(s.manifold);
+    }
+
+    #[test]
+    fn group_is_named_after_its_longest_deck() {
+        // A short footway deck, listed first, joins the road deck at its
+        // north end: different kinds never merge, so one group of two decks.
+        let mut ramp = deck(1, vec![(11.3375, 44.4957), (11.3380, 44.4960)]);
+        ramp.kind = BridgeKind::Path;
+        ramp.width_m = 3.0;
+        let f = BridgeFeatures { ways: vec![ramp, deck(2, crossing())], ..Default::default() };
+        let s = scene(20.0, &f);
+        let groups = s.build.report["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{}", s.build.report);
+        assert_eq!(groups[0]["name"], "deck 2");
+        assert_eq!(groups[0]["names"], serde_json::json!(["deck 2", "deck 1"]));
     }
 
     #[test]
