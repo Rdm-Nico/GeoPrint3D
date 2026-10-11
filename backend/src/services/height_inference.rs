@@ -286,6 +286,37 @@ fn clamp_to_range(h: f32, (lo, hi): (f32, f32)) -> f32 {
 /// Replace per-type default heights of generic outlines with contextual
 /// estimates. Deterministic: every estimate is computed from the input state
 /// (two-phase), never from heights updated earlier in the same pass.
+// Soft-knee compression of outlier-tall elements (see `soft_knee`).
+const KNEE_MULT: f32 = 3.0;
+const KNEE_FLOOR_M: f32 = 20.0;
+const KNEE_SLOPE: f32 = 0.30;
+const FALLBACK_MEDIAN_M: f32 = 12.0;
+
+/// (median outline height, knee) of the scene's height compression: the knee
+/// is 3× the median, floored at 20 m. The median is taken over outlines only —
+/// a decomposed landmark (St Peter's has dozens of tall building:part
+/// elements) would otherwise drag the knee upward and escape compression.
+pub fn scene_knee(buildings: &[Building]) -> (f32, f32) {
+    let mut h: Vec<f32> = buildings.iter().filter(|b| !b.is_part).map(|b| b.height).collect();
+    if h.is_empty() {
+        h = buildings.iter().map(|b| b.height).collect();
+    }
+    h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = h.get(h.len() / 2).copied().unwrap_or(FALLBACK_MEDIAN_M);
+    (median, (median * KNEE_MULT).max(KNEE_FLOOR_M))
+}
+
+/// Monotone height compression: linear up to `knee`, slope 0.3 above it.
+/// Real 100 m+ landmarks (St Peter's, the Asinelli tower, bridge towers) would
+/// otherwise dwarf a 10 m city; heights below the knee stay untouched.
+pub fn soft_knee(h: f32, knee: f32) -> f32 {
+    if h > knee {
+        knee + (h - knee) * KNEE_SLOPE
+    } else {
+        h
+    }
+}
+
 pub fn infer_missing_heights(buildings: &mut [Building], bbox: &BoundingBox) -> InferenceReport {
     let n = buildings.len();
     let mut report = InferenceReport::default();

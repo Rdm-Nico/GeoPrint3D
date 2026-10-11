@@ -48,6 +48,10 @@ pub struct GenerateRequest {
     pub include_buildings: Option<bool>,  // Include OSM buildings (default: true)
     pub print_size: Option<f32>,  // Largest XY print dimension in mm (default: 180.0)
     pub include_water: Option<bool>,  // Include sea / lakes / rivers (default: true)
+    pub include_bridges: Option<bool>,  // Include bridge decks, piers and towers (default: true)
+    /// Integrate removable breakaway columns under bridge spans too long for
+    /// FDM bridging (default: true). Assumes 0.2 mm layers.
+    pub bridge_print_supports: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +70,10 @@ pub struct MeshData {
     /// triangles[terrain_tc - this..terrain_tc], are water surface. Clients
     /// that ignore the field simply render water as terrain.
     pub water_triangle_count: usize,
+    /// triangles[terrain_tc + building_tc .. + this] are removable print
+    /// supports (breakaway columns under long bridge spans). Bridge decks,
+    /// piers and towers are part of the building range.
+    pub support_triangle_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +85,7 @@ pub struct MeshStats {
     pub max_elevation: f32,
     pub buildings_count: usize,
     pub water_features_count: usize,
+    pub bridges_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +236,92 @@ pub struct WaterFeatures {
 impl WaterFeatures {
     pub fn is_empty(&self) -> bool {
         self.areas.is_empty() && self.waterways.is_empty() && self.coastlines.is_empty()
+    }
+}
+
+/// What a bridge deck carries. Drives the default width and the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BridgeKind {
+    Road,
+    Rail,
+    Path,
+    Aqueduct,
+}
+
+impl BridgeKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BridgeKind::Road => "road",
+            BridgeKind::Rail => "rail",
+            BridgeKind::Path => "path",
+            BridgeKind::Aqueduct => "aqueduct",
+        }
+    }
+}
+
+/// A way carried by a bridge (`bridge=*` on a highway / railway / waterway).
+/// Its ends are where the deck meets the ground (the abutments).
+#[derive(Debug, Clone)]
+pub struct BridgeWay {
+    pub id: u64,
+    pub line: Vec<(f64, f64)>, // (lon, lat)
+    pub kind: BridgeKind,
+    pub layer: i8,
+    pub width_m: f32,
+    /// Where `width_m` came from: "width", "est_width", "lanes" or "default".
+    pub width_source: &'static str,
+    pub name: Option<String>,
+    /// `bridge:structure` (arch, suspension, beam, …) when tagged.
+    pub structure: Option<String>,
+}
+
+/// `man_made=bridge`: the outline of the whole structure.
+#[derive(Debug, Clone)]
+pub struct BridgeOutline {
+    pub id: u64,
+    pub outer: Vec<(f64, f64)>, // (lon, lat), no closing duplicate
+    pub layer: i8,
+    pub name: Option<String>,
+}
+
+/// Role of a mapped bridge support. Decided by tags only: `pylon` or
+/// `man_made=tower` rise above the deck, everything else stops under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportRole {
+    Pier,
+    Tower,
+}
+
+/// A mapped bridge support (`bridge:support=pier|pylon|…`, bridge towers).
+#[derive(Debug, Clone)]
+pub struct BridgeSupport {
+    pub id: u64,
+    pub outer: Vec<(f64, f64)>, // (lon, lat), no closing duplicate
+    pub role: SupportRole,
+    pub height_m: Option<f32>,
+    /// Signed: a negative value means the element is mapped relative to the
+    /// deck (Millau pylons: `min_height=-245`, `height=90`).
+    pub min_height_m: Option<f32>,
+    /// The element parsed as a building when it carries building tags, so
+    /// the handler can hand it back to the building path (e.g. a pier base
+    /// that carries stacked `building:part` towers).
+    pub building: Option<Building>,
+    /// Handed back to the building path: still a mapped support (no default
+    /// piers on its bridge, a stop for span lengths) but not emitted twice.
+    pub as_building: bool,
+}
+
+/// Raw bridge elements of one request, as fetched from OSM.
+#[derive(Debug, Clone, Default)]
+pub struct BridgeFeatures {
+    pub ways: Vec<BridgeWay>,
+    pub outlines: Vec<BridgeOutline>,
+    pub supports: Vec<BridgeSupport>,
+}
+
+impl BridgeFeatures {
+    pub fn is_empty(&self) -> bool {
+        self.ways.is_empty() && self.outlines.is_empty() && self.supports.is_empty()
     }
 }
 

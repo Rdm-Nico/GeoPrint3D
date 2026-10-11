@@ -1,5 +1,6 @@
 use crate::models::{
-    BoundingBox, Building, HeightSource, RoofShape, WaterArea, WaterFeatures, WaterKind, Waterway,
+    BoundingBox, BridgeFeatures, BridgeKind, BridgeOutline, BridgeSupport, BridgeWay, Building,
+    HeightSource, RoofShape, SupportRole, WaterArea, WaterFeatures, WaterKind, Waterway,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -47,6 +48,8 @@ struct FetchStats {
     relations: usize,
     /// Water elements dropped (underground / culverted / incomplete rings).
     water_skipped: usize,
+    /// Bridge elements dropped (open outlines, incomplete relations).
+    bridge_skipped: usize,
     /// Water relations whose members came back incomplete from their tile.
     /// They are re-fetched whole after the merge (see `fetch_features`).
     pending: Vec<PendingRelation>,
@@ -85,6 +88,7 @@ enum Gate {
 pub struct FetchOptions {
     pub buildings: bool,
     pub water: bool,
+    pub bridges: bool,
 }
 
 /// Everything one fetch returns.
@@ -92,6 +96,7 @@ pub struct FetchOptions {
 pub struct OsmFeatures {
     pub buildings: Vec<Building>,
     pub water: WaterFeatures,
+    pub bridges: BridgeFeatures,
 }
 
 // Default widths (m) of linear waterways without a `width` tag.
@@ -262,8 +267,8 @@ impl OsmService {
         min_area_m2: f64,
     ) -> Result<OsmFeatures> {
         tracing::info!(
-            "   ┌─ OpenStreetMap Feature Service (buildings: {}, water: {})",
-            opts.buildings, opts.water
+            "   ┌─ OpenStreetMap Feature Service (buildings: {}, water: {}, bridges: {})",
+            opts.buildings, opts.water, opts.bridges
         );
         tracing::info!(
             "   │  Bbox: ({:.4}, {:.4}) → ({:.4}, {:.4})",
@@ -427,8 +432,15 @@ impl OsmService {
         if opts.water {
             log_water_stats(&out.water, stats.water_skipped);
         }
+        if opts.bridges {
+            log_bridge_stats(&out.bridges, stats.bridge_skipped);
+        }
         tracing::info!("   └─ OSM processing time: {:.2}s", request_start.elapsed().as_secs_f64());
-        Ok(OsmFeatures { buildings, water: std::mem::take(&mut out.water) })
+        Ok(OsmFeatures {
+            buildings,
+            water: std::mem::take(&mut out.water),
+            bridges: std::mem::take(&mut out.bridges),
+        })
     }
 }
 
@@ -454,31 +466,55 @@ enum ElementClass {
     WaterArea(WaterKind),
     Waterway(WaterKind),
     Coastline,
+    BridgeWay(BridgeKind),
+    BridgeOutline,
+    BridgeSupport(SupportRole),
     Skip,
 }
 
-/// Route an element by its tags. Buildings win over water tags (a building
-/// outline that also carries `natural=water` is still a building). Relations
-/// must be multipolygons; waterways and coastlines are ways only.
+/// Route an element by its tags. Bridge supports (piers, pylons, bridge
+/// towers) are checked first when bridges are on: their legs are thinner than
+/// the building footprint filter, and the bridge module merges them into
+/// printable blocks. Then buildings win over everything else (`building=bridge`
+/// is still a building, and a building outline that also carries
+/// `natural=water` is still a building). Relations must be multipolygons;
+/// waterways, coastlines and bridge decks are ways only.
 fn classify_element(tags: &Value, is_relation: bool, opts: FetchOptions) -> ElementClass {
     let tag = |k: &str| tags[k].as_str();
     if is_relation && tag("type") != Some("multipolygon") {
         return ElementClass::Skip;
     }
 
+    if opts.bridges {
+        if let Some(role) = support_role(tags) {
+            return ElementClass::BridgeSupport(role);
+        }
+    }
     let is_building = tag("building").is_some_and(|v| v != "no");
     let is_part = tag("building:part").is_some_and(|v| v != "no");
     if is_building || is_part {
         return if opts.buildings { ElementClass::Building } else { ElementClass::Skip };
+    }
+    if opts.bridges {
+        if tag("man_made") == Some("bridge") {
+            return ElementClass::BridgeOutline;
+        }
+        if !is_relation {
+            if let Some(kind) = bridge_way_kind(tags) {
+                return ElementClass::BridgeWay(kind);
+            }
+        }
     }
     if !opts.water {
         return ElementClass::Skip;
     }
 
     // Water that is not visible from above (culverts, covered reservoirs,
-    // underground channels) is not modelled.
+    // underground channels) is not modelled. Neither is water carried by a
+    // bridge (aqueducts): it runs above the terrain, not in it.
     let hidden = tag("tunnel").is_some_and(|v| v != "no")
         || tag("covered").is_some_and(|v| v != "no")
+        || tag("bridge").is_some_and(|v| v != "no")
         || matches!(tag("location"), Some("underground" | "indoor"));
 
     if !is_relation && tag("natural") == Some("coastline") {
@@ -523,6 +559,103 @@ fn classify_element(tags: &Value, is_relation: bool, opts: FetchOptions) -> Elem
     }
 
     ElementClass::Skip
+}
+
+/// Role of a mapped bridge support, or `None` for anything else (abutments
+/// stay buildings: they stand on land and carry no deck span).
+fn support_role(tags: &Value) -> Option<SupportRole> {
+    let tag = |k: &str| tags[k].as_str();
+    if tag("man_made") == Some("tower") && tag("tower:type") == Some("bridge") {
+        return Some(SupportRole::Tower);
+    }
+    match tag("bridge:support") {
+        Some("pylon") => Some(SupportRole::Tower),
+        Some("pier" | "lift_pier" | "pivot_pier") => Some(SupportRole::Pier),
+        _ => None,
+    }
+}
+
+/// What a `bridge=*` way carries, or `None` when it is not a deck we model
+/// (no bridge, a tunnel, an indoor corridor, or a road that does not exist yet
+/// or anymore).
+fn bridge_way_kind(tags: &Value) -> Option<BridgeKind> {
+    let tag = |k: &str| tags[k].as_str();
+    if !tag("bridge").is_some_and(|v| v != "no") {
+        return None;
+    }
+    if tag("tunnel").is_some_and(|v| v != "no") || matches!(tag("location"), Some("underground" | "indoor")) {
+        return None;
+    }
+    // Lifecycle values whose deck does not stand (yet / anymore). Abandoned
+    // and disused railways keep their bridges, so they stay.
+    const NOT_BUILT: &[&str] = &["proposed", "construction", "razed", "dismantled", "platform"];
+    if let Some(h) = tag("highway") {
+        return match h {
+            _ if NOT_BUILT.contains(&h) => None,
+            "abandoned" | "elevator" | "corridor" => None,
+            "footway" | "path" | "cycleway" | "pedestrian" | "bridleway" | "steps" | "track" => Some(BridgeKind::Path),
+            _ => Some(BridgeKind::Road),
+        };
+    }
+    if let Some(r) = tag("railway") {
+        return if NOT_BUILT.contains(&r) { None } else { Some(BridgeKind::Rail) };
+    }
+    if tag("waterway").is_some() {
+        return Some(BridgeKind::Aqueduct);
+    }
+    None
+}
+
+/// Deck width (m) of a bridge way and where it came from: `width` →
+/// `est_width` → `lanes` (3.25 m per lane + 1.5 m of kerbs) → per-type default.
+fn bridge_width(tags: &Value, kind: BridgeKind) -> (f32, &'static str) {
+    let metres = |k: &str| tags[k].as_str().and_then(parse_meters).filter(|w| *w > 0.5 && *w < 300.0);
+    if let Some(w) = metres("width") {
+        return (w, "width");
+    }
+    if let Some(w) = metres("est_width") {
+        return (w, "est_width");
+    }
+    if kind == BridgeKind::Road {
+        if let Some(l) = tags["lanes"].as_str().and_then(|s| s.trim().parse::<f32>().ok()).filter(|l| *l >= 1.0 && *l <= 16.0) {
+            return (l * 3.25 + 1.5, "lanes");
+        }
+    }
+    let w = match kind {
+        BridgeKind::Rail => {
+            let tracks = tags["tracks"].as_str().and_then(|s| s.trim().parse::<f32>().ok()).filter(|t| *t >= 1.0 && *t <= 8.0);
+            match tags["railway"].as_str() {
+                Some("tram") => 6.0,
+                _ => 5.0 * tracks.unwrap_or(1.0),
+            }
+        }
+        BridgeKind::Aqueduct => 6.0,
+        BridgeKind::Path => match tags["highway"].as_str() {
+            Some("steps") => 2.5,
+            _ => 3.0,
+        },
+        BridgeKind::Road => match tags["highway"].as_str() {
+            Some("motorway" | "trunk") => 12.0,
+            Some("primary") => 10.0,
+            Some("secondary") => 9.0,
+            Some("tertiary") => 8.0,
+            Some("service") => 5.0,
+            _ => 7.0, // residential, unclassified, living_street, links, …
+        },
+    };
+    (w, "default")
+}
+
+/// `layer` as an integer (bridges without one sit on layer 1, the OSM convention).
+fn bridge_layer(tags: &Value) -> i8 {
+    tags["layer"]
+        .as_str()
+        .and_then(|s| s.trim().parse::<i8>().ok())
+        .unwrap_or(1)
+}
+
+fn bridge_name(tags: &Value) -> Option<String> {
+    tags["bridge:name"].as_str().or(tags["name"].as_str()).map(str::to_string)
 }
 
 /// Parse an Overpass `out geom` response.
@@ -739,8 +872,66 @@ fn push_way(ctx: &mut ParseCtx, class: ElementClass, id: u64, coords: Vec<(f64, 
             ctx.out.water.waterways.push(Waterway { id, kind, line: coords, width_m });
         }
         ElementClass::Coastline => ctx.out.water.coastlines.push((id, coords)),
+        ElementClass::BridgeWay(kind) => {
+            let (width_m, width_source) = bridge_width(tags, kind);
+            ctx.out.bridges.ways.push(BridgeWay {
+                id,
+                line: coords,
+                kind,
+                layer: bridge_layer(tags),
+                width_m,
+                width_source,
+                name: bridge_name(tags),
+                structure: tags["bridge:structure"].as_str().map(str::to_string),
+            });
+        }
+        ElementClass::BridgeOutline => match closed_ring(coords) {
+            Some(outer) => ctx.out.bridges.outlines.push(BridgeOutline {
+                id,
+                outer,
+                layer: bridge_layer(tags),
+                name: bridge_name(tags),
+            }),
+            None => ctx.stats.bridge_skipped += 1,
+        },
+        ElementClass::BridgeSupport(role) => match closed_ring(coords) {
+            Some(outer) => push_support(ctx, id, role, outer, Vec::new(), tags),
+            None => ctx.stats.bridge_skipped += 1,
+        },
         ElementClass::Skip => {}
     }
+}
+
+/// A mapped bridge support. Never footprint-filtered: tower legs are thinner
+/// than the building filter, and the bridge module merges them into printable
+/// blocks. Building-tagged supports keep their building parse, so the handler
+/// can hand them back to the building path when they carry stacked parts.
+fn push_support(
+    ctx: &mut ParseCtx,
+    id: u64,
+    role: SupportRole,
+    outer: Vec<(f64, f64)>,
+    holes: Vec<Vec<(f64, f64)>>,
+    tags: &Value,
+) {
+    let outer_clipped = clip_ring_to_bbox(&outer, ctx.bbox);
+    if outer_clipped.len() < 3 {
+        ctx.stats.bridge_skipped += 1;
+        return;
+    }
+    let is_building = tags["building"].as_str().is_some_and(|v| v != "no")
+        || tags["building:part"].as_str().is_some_and(|v| v != "no");
+    let building = is_building.then(|| building_from(id, outer, holes, tags, ctx.bbox, &mut ctx.stats.src)).flatten();
+    let metres = |k: &str| tags[k].as_str().and_then(parse_meters);
+    ctx.out.bridges.supports.push(BridgeSupport {
+        id,
+        outer: outer_clipped,
+        role,
+        height_m: metres("height").or_else(|| metres("est_height")).filter(|h| *h > 0.0),
+        min_height_m: metres("min_height"),
+        building,
+        as_building: false,
+    });
 }
 
 /// Dispatch one parsed multipolygon relation by class. Returns `false` when a
@@ -790,6 +981,30 @@ fn push_multipolygon(ctx: &mut ParseCtx, class: ElementClass, id: u64, rel: Memb
                     .cloned()
                     .collect();
                 ctx.out.water.areas.push(WaterArea { id, kind, outer, holes });
+            }
+            true
+        }
+        ElementClass::BridgeOutline | ElementClass::BridgeSupport(_) => {
+            // Outlines are only width hints and supports are rare as
+            // relations: an incomplete copy is dropped without a whole-
+            // relation refetch (but left unseen, so a complete copy from
+            // another tile still lands).
+            let (outer_rings, open) = assemble_rings_checked(rel.outer);
+            if rel.missing + open > 0 || outer_rings.is_empty() {
+                ctx.stats.bridge_skipped += 1;
+                return true;
+            }
+            ctx.seen.insert((true, id));
+            for outer in outer_rings {
+                match class {
+                    ElementClass::BridgeSupport(role) => push_support(ctx, id, role, outer, Vec::new(), tags),
+                    _ => ctx.out.bridges.outlines.push(BridgeOutline {
+                        id,
+                        outer,
+                        layer: bridge_layer(tags),
+                        name: bridge_name(tags),
+                    }),
+                }
             }
             true
         }
@@ -962,6 +1177,20 @@ fn overpass_query(tile: &BoundingBox, opts: FetchOptions) -> String {
              way[\"natural\"=\"coastline\"]({bb});"
         ));
     }
+    if opts.bridges {
+        // Decks, whole-structure outlines and mapped supports. Building-tagged
+        // towers (Golden Gate's building:part stacks) are matched by the
+        // man_made=tower line even when buildings are off.
+        q.push_str(&format!(
+            "way[\"bridge\"][\"bridge\"!=\"no\"][\"highway\"]({bb});\
+             way[\"bridge\"][\"bridge\"!=\"no\"][\"railway\"]({bb});\
+             way[\"bridge\"][\"bridge\"!=\"no\"][\"waterway\"]({bb});\
+             way[\"man_made\"=\"bridge\"]({bb});\
+             relation[\"type\"=\"multipolygon\"][\"man_made\"=\"bridge\"]({bb});\
+             way[\"bridge:support\"]({bb});\
+             way[\"man_made\"=\"tower\"][\"tower:type\"=\"bridge\"]({bb});"
+        ));
+    }
     q.push_str(");out geom qt;");
     q
 }
@@ -1079,13 +1308,32 @@ fn push_building(
     min_area_m2: f64,
     src: &mut HeightSources,
 ) {
+    let clipped = clip_ring_to_bbox(&footprint, bbox);
+    if clipped.len() < 3 || footprint_area_m2(&clipped) < min_area_m2 {
+        src.skipped += 1;
+        return;
+    }
+    if let Some(b) = building_from(id, footprint, holes, tags, bbox, src) {
+        buildings.push(b);
+    }
+}
+
+/// Parse one building element (footprint clipped to the bbox), without the
+/// footprint-area filter.
+fn building_from(
+    id: u64,
+    footprint: Vec<(f64, f64)>,
+    holes: Vec<Vec<(f64, f64)>>,
+    tags: &Value,
+    bbox: &BoundingBox,
+    src: &mut HeightSources,
+) -> Option<Building> {
     // Inference (roof shape from a quad footprint) looks at the original
     // corner count, not the clip-induced one.
     let corners = corner_count(&footprint);
     let footprint = clip_ring_to_bbox(&footprint, bbox);
-    if footprint.len() < 3 || footprint_area_m2(&footprint) < min_area_m2 {
-        src.skipped += 1;
-        return;
+    if footprint.len() < 3 {
+        return None;
     }
     let holes: Vec<Vec<(f64, f64)>> = holes
         .into_iter()
@@ -1093,7 +1341,7 @@ fn push_building(
         .filter(|h| h.len() >= 3)
         .collect();
     let parsed = parse_building_tags(tags, id, corners, src);
-    buildings.push(Building {
+    Some(Building {
         id,
         footprint,
         holes,
@@ -1104,7 +1352,7 @@ fn push_building(
         is_part: parsed.is_part,
         kind: parsed.kind,
         height_source: parsed.height_source,
-    });
+    })
 }
 
 /// Sutherland–Hodgman clip of a polygon ring against the request bbox
@@ -1431,9 +1679,23 @@ fn building_height(tags: &Value, kind: &str, id: u64, src: &mut HeightSources) -
     (default_height_for_type(kind) * jitter(id), HeightSource::TypeDefault)
 }
 
-/// Parse a metric height value, tolerating a trailing unit and "a-b" ranges (→ midpoint).
+/// Parse a height / width value in metres, tolerating a trailing unit, "a-b"
+/// ranges (→ midpoint), a sign (deck-relative `min_height=-245`) and feet
+/// (`30'`, `12'6"`, `143 ft`, as mapped on Tower Bridge).
 fn parse_meters(s: &str) -> Option<f32> {
-    let s = s.trim().trim_end_matches(['m', ' ']).trim();
+    const FOOT_M: f32 = 0.3048;
+    let t = s.trim();
+    let lower = t.to_ascii_lowercase();
+    if let Some(ft) = lower.strip_suffix("feet").or_else(|| lower.strip_suffix("ft")) {
+        return ft.trim().parse::<f32>().ok().map(|f| f * FOOT_M);
+    }
+    if let Some((ft, inch)) = t.split_once('\'') {
+        let ft = ft.trim().parse::<f32>().ok()?;
+        let inch = inch.trim().trim_end_matches('"').trim();
+        let inch = if inch.is_empty() { 0.0 } else { inch.parse::<f32>().ok()? };
+        return Some((ft + inch / 12.0) * FOOT_M);
+    }
+    let s = t.trim_end_matches(['m', ' ']).trim();
     if let Some((a, b)) = s.split_once('-') {
         if let (Ok(a), Ok(b)) = (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
             return Some((a + b) / 2.0);
@@ -1496,6 +1758,22 @@ fn log_water_stats(water: &WaterFeatures, skipped: usize) {
     }
 }
 
+fn log_bridge_stats(bridges: &BridgeFeatures, skipped: usize) {
+    let mut by_kind: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for w in &bridges.ways {
+        *by_kind.entry(w.kind.name()).or_insert(0) += 1;
+    }
+    let towers = bridges.supports.iter().filter(|s| s.role == SupportRole::Tower).count();
+    tracing::info!(
+        "   │  🌉 Bridges: {} deck way(s) {:?}, {} outline(s), {} support(s) ({} tower, {} pier)",
+        bridges.ways.len(), by_kind, bridges.outlines.len(), bridges.supports.len(),
+        towers, bridges.supports.len() - towers
+    );
+    if skipped > 0 {
+        tracing::debug!("   │  Skipped {} bridge element(s) (open rings / incomplete relations)", skipped);
+    }
+}
+
 fn log_building_stats(
     buildings: &[Building],
     src: &HeightSources,
@@ -1555,7 +1833,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const ALL: FetchOptions = FetchOptions { buildings: true, water: true };
+    const ALL: FetchOptions = FetchOptions { buildings: true, water: true, bridges: true };
 
     #[test]
     fn classify_routes_by_tags() {
@@ -1583,10 +1861,111 @@ mod tests {
         assert_eq!(c(json!({"natural": "coastline"}), false), ElementClass::Coastline);
         // Buildings win over water tags; disabled classes are skipped.
         assert_eq!(c(json!({"building": "yes", "natural": "water"}), false), ElementClass::Building);
-        let water_only = FetchOptions { buildings: false, water: true };
+        let water_only = FetchOptions { buildings: false, water: true, bridges: false };
         assert_eq!(classify_element(&json!({"building": "yes"}), false, water_only), ElementClass::Skip);
-        let buildings_only = FetchOptions { buildings: true, water: false };
+        let buildings_only = FetchOptions { buildings: true, water: false, bridges: false };
         assert_eq!(classify_element(&json!({"natural": "water"}), false, buildings_only), ElementClass::Skip);
+    }
+
+    #[test]
+    fn classify_bridges() {
+        let c = |t: Value, rel: bool| classify_element(&t, rel, ALL);
+        let road = ElementClass::BridgeWay(BridgeKind::Road);
+        assert_eq!(c(json!({"highway": "primary", "bridge": "yes"}), false), road);
+        assert_eq!(c(json!({"highway": "footway", "bridge": "yes"}), false), ElementClass::BridgeWay(BridgeKind::Path));
+        assert_eq!(c(json!({"railway": "rail", "bridge": "viaduct"}), false), ElementClass::BridgeWay(BridgeKind::Rail));
+        assert_eq!(c(json!({"railway": "abandoned", "bridge": "yes"}), false), ElementClass::BridgeWay(BridgeKind::Rail));
+        assert_eq!(c(json!({"highway": "primary", "bridge": "no"}), false), ElementClass::Skip);
+        assert_eq!(c(json!({"highway": "construction", "bridge": "yes"}), false), ElementClass::Skip);
+        assert_eq!(c(json!({"highway": "primary"}), false), ElementClass::Skip);
+        assert_eq!(c(json!({"highway": "primary", "bridge": "yes"}), true), ElementClass::Skip, "decks are ways");
+        // building=bridge (covered bridges, skyways) stays a building.
+        assert_eq!(c(json!({"building": "bridge"}), false), ElementClass::Building);
+        // Aqueducts are decks, never water — and not water with bridges off either.
+        let aqueduct = json!({"waterway": "canal", "bridge": "aqueduct"});
+        assert_eq!(c(aqueduct.clone(), false), ElementClass::BridgeWay(BridgeKind::Aqueduct));
+        let no_bridges = FetchOptions { buildings: true, water: true, bridges: false };
+        assert_eq!(classify_element(&aqueduct, false, no_bridges), ElementClass::Skip);
+        // Outlines and supports.
+        assert_eq!(c(json!({"man_made": "bridge"}), false), ElementClass::BridgeOutline);
+        assert_eq!(c(json!({"type": "multipolygon", "man_made": "bridge"}), true), ElementClass::BridgeOutline);
+        let pylon = json!({"building": "yes", "bridge:support": "pylon", "height": "82.9"});
+        assert_eq!(c(pylon.clone(), false), ElementClass::BridgeSupport(SupportRole::Tower));
+        assert_eq!(classify_element(&pylon, false, no_bridges), ElementClass::Building, "unchanged with bridges off");
+        let gg_part = json!({"building:part": "yes", "man_made": "tower", "tower:type": "bridge", "bridge:support": "pier"});
+        assert_eq!(c(gg_part, false), ElementClass::BridgeSupport(SupportRole::Tower), "a bridge tower wins over pier");
+        assert_eq!(c(json!({"bridge:support": "pier"}), false), ElementClass::BridgeSupport(SupportRole::Pier));
+        assert_eq!(c(json!({"building": "yes", "bridge:support": "abutment"}), false), ElementClass::Building);
+    }
+
+    #[test]
+    fn bridge_width_fallback_chain() {
+        let w = |t: Value, k: BridgeKind| bridge_width(&t, k);
+        assert_eq!(w(json!({"highway": "primary", "width": "14 m", "lanes": "2"}), BridgeKind::Road), (14.0, "width"));
+        assert_eq!(w(json!({"highway": "primary", "est_width": "11", "lanes": "2"}), BridgeKind::Road), (11.0, "est_width"));
+        assert_eq!(w(json!({"highway": "primary", "lanes": "4"}), BridgeKind::Road), (14.5, "lanes"));
+        assert_eq!(w(json!({"highway": "motorway"}), BridgeKind::Road), (12.0, "default"));
+        assert_eq!(w(json!({"highway": "footway", "lanes": "2"}), BridgeKind::Path), (3.0, "default"));
+        assert_eq!(w(json!({"railway": "rail", "tracks": "2"}), BridgeKind::Rail), (10.0, "default"));
+        assert_eq!(w(json!({"waterway": "canal"}), BridgeKind::Aqueduct), (6.0, "default"));
+    }
+
+    #[test]
+    fn parse_meters_handles_feet_and_sign() {
+        let close = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-3);
+        assert!(close(parse_meters("30'"), 9.144));
+        assert!(close(parse_meters("143 ft"), 43.586));
+        assert!(close(parse_meters("12'6\""), 3.81));
+        assert!(close(parse_meters("-245"), -245.0), "deck-relative min_height keeps its sign");
+        assert!(close(parse_meters("12 m"), 12.0));
+        assert!(close(parse_meters("10-20"), 15.0));
+    }
+
+    #[test]
+    fn both_parsers_dispatch_bridges() {
+        let deck = vec![(11.336, 44.493), (11.336, 44.497)];
+        let fixtures: Vec<(u64, Value, Vec<(f64, f64)>)> = vec![
+            (21, json!({"highway": "secondary", "bridge": "yes", "layer": "2", "name": "Ponte"}), deck),
+            (22, json!({"man_made": "bridge"}), square(11.3355, 44.4945)),
+            (23, json!({"building": "yes", "bridge:support": "pylon", "min_height": "-20", "height": "60"}), square(11.3358, 44.4950)),
+        ];
+        let geom: Vec<Value> = fixtures
+            .iter()
+            .map(|(id, tags, pts)| {
+                json!({
+                    "type": "way", "id": id, "tags": tags,
+                    "geometry": pts.iter().map(|&(lon, lat)| json!({"lon": lon, "lat": lat})).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let mut noderefs: Vec<Value> = Vec::new();
+        let mut next = 500u64;
+        for (id, tags, pts) in &fixtures {
+            let mut refs = Vec::new();
+            for &(lon, lat) in pts {
+                next += 1;
+                noderefs.push(json!({"type": "node", "id": next, "lon": lon, "lat": lat}));
+                refs.push(next);
+            }
+            // closed rings reuse their first node
+            if pts.first() == pts.last() {
+                *refs.last_mut().unwrap() = refs[0];
+            }
+            noderefs.push(json!({"type": "way", "id": id, "tags": tags, "nodes": refs}));
+        }
+        for out in [parse(json!({ "elements": geom }), false), parse(json!({ "elements": noderefs }), true)] {
+            let b = &out.bridges;
+            assert_eq!(b.ways.len(), 1);
+            assert_eq!(b.ways[0].layer, 2);
+            assert_eq!(b.ways[0].width_m, 9.0);
+            assert_eq!(b.ways[0].name.as_deref(), Some("Ponte"));
+            assert_eq!(b.outlines.len(), 1);
+            assert_eq!(b.supports.len(), 1);
+            assert_eq!(b.supports[0].role, SupportRole::Tower);
+            assert_eq!(b.supports[0].min_height_m, Some(-20.0));
+            assert!(b.supports[0].building.is_some(), "building-tagged support keeps its building parse");
+            assert!(out.buildings.is_empty(), "the pylon is not extruded as a building");
+        }
     }
 
     fn bbox() -> BoundingBox {
@@ -1691,7 +2070,7 @@ mod tests {
         let mut ctx = ParseCtx {
             bbox: &b,
             min_area_m2: 0.0,
-            opts: FetchOptions { buildings: false, water: true },
+            opts: FetchOptions { buildings: false, water: true, bridges: false },
             seen: &mut seen,
             out: &mut out,
             stats: &mut stats,
@@ -1714,7 +2093,7 @@ mod tests {
         let mut ctx = ParseCtx {
             bbox: &b,
             min_area_m2: 0.0,
-            opts: FetchOptions { buildings: false, water: true },
+            opts: FetchOptions { buildings: false, water: true, bridges: false },
             seen: &mut seen,
             out: &mut out,
             stats: &mut stats,
@@ -1759,7 +2138,7 @@ mod tests {
         let mut ctx = ParseCtx {
             bbox: &b,
             min_area_m2: 0.0,
-            opts: FetchOptions { buildings: false, water: true },
+            opts: FetchOptions { buildings: false, water: true, bridges: false },
             seen: &mut seen,
             out: &mut out,
             stats: &mut stats,
@@ -1778,7 +2157,7 @@ mod tests {
         let mut ctx2 = ParseCtx {
             bbox: &b,
             min_area_m2: 0.0,
-            opts: FetchOptions { buildings: false, water: true },
+            opts: FetchOptions { buildings: false, water: true, bridges: false },
             seen: &mut seen2,
             out: &mut out2,
             stats: &mut stats2,

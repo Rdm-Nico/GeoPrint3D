@@ -746,7 +746,7 @@ fn pava_non_increasing(values: &[f64], weights: &[f64]) -> Vec<f64> {
 
 // ── Flow chains ───────────────────────────────────────────────────────────────
 
-fn node_key(p: Pt) -> (u64, u64) {
+pub(crate) fn node_key(p: Pt) -> (u64, u64) {
     (p.0.to_bits(), p.1.to_bits())
 }
 

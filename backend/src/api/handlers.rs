@@ -1,11 +1,13 @@
 use crate::models::{
-    BoundingBox, Building, GenerateRequest, GenerateResponse, MeshData, MeshStats, TerrainMesh,
-    WaterFeatures,
+    BoundingBox, BridgeFeatures, Building, GenerateRequest, GenerateResponse, MeshData, MeshStats,
+    TerrainMesh, WaterFeatures,
 };
 use crate::services::osm::FetchOptions;
 use crate::services::water::{assemble_sea, SeaOutcome};
 use crate::services::{ElevationService, OsmService};
+use crate::utils::bridges::{hand_back_stacked_bases, BridgeBuild, BridgePlan, SolveParams};
 use crate::utils::hydro::{HydroModel, WATER_RECESS_MM};
+use crate::utils::mesh::TerrainSurface;
 use crate::utils::{
     CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshExporter, MeshGenerator,
 };
@@ -81,6 +83,7 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Base height: {:?} mm", request.base_height);
     tracing::info!("   └─ Include buildings: {:?}", request.include_buildings);
     tracing::info!("   └─ Include water: {:?}", request.include_water);
+    tracing::info!("   └─ Include bridges: {:?} (print supports: {:?})", request.include_bridges, request.bridge_print_supports);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 1: Validate bounding box area
@@ -110,6 +113,8 @@ pub async fn generate_terrain(
     let base_height = request.base_height.unwrap_or(2.0);
     let include_buildings = request.include_buildings.unwrap_or(true);
     let include_water = request.include_water.unwrap_or(true);
+    let include_bridges = request.include_bridges.unwrap_or(true);
+    let bridge_print_supports = request.bridge_print_supports.unwrap_or(true);
     // Largest XY dimension of the printed model in mm.
     let print_size_mm = request.print_size.unwrap_or(180.0);
 
@@ -120,6 +125,7 @@ pub async fn generate_terrain(
     tracing::info!("   └─ Print size: {} mm (largest XY dimension)", print_size_mm);
     tracing::info!("   └─ Include buildings: {}", include_buildings);
     tracing::info!("   └─ Include water: {}", include_water);
+    tracing::info!("   └─ Include bridges: {} (removable print supports: {})", include_bridges, bridge_print_supports);
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 3: Fetch elevation data from external API
@@ -183,23 +189,25 @@ pub async fn generate_terrain(
         MIN_PRINTED_FOOTPRINT_MM2 / (mm_per_m * mm_per_m)
     };
 
-    // Buildings and water travel in ONE Overpass query per tile.
+    // Buildings, water and bridges travel in ONE Overpass query per tile.
     let mut water_features = WaterFeatures::default();
-    let mut buildings = if !include_buildings && !include_water {
-        tracing::info!("🏢 STEP 4/8: Skipping OSM data (buildings and water disabled by user)");
+    let mut bridge_features = BridgeFeatures::default();
+    let mut buildings = if !include_buildings && !include_water && !include_bridges {
+        tracing::info!("🏢 STEP 4/8: Skipping OSM data (buildings, water and bridges disabled by user)");
         Vec::new()
     } else {
         tracing::info!(
-            "🏢 STEP 4/8: Fetching OpenStreetMap data (buildings: {}, water: {})",
-            include_buildings, include_water
+            "🏢 STEP 4/8: Fetching OpenStreetMap data (buildings: {}, water: {}, bridges: {})",
+            include_buildings, include_water, include_bridges
         );
         tracing::info!("   └─ This step makes an HTTP request to Overpass API...");
 
-        let opts = FetchOptions { buildings: include_buildings, water: include_water };
+        let opts = FetchOptions { buildings: include_buildings, water: include_water, bridges: include_bridges };
         match state.osm_service.fetch_features(&request.bbox, opts, min_building_area_m2).await {
             Ok(f) => {
                 let b = f.buildings;
                 water_features = f.water;
+                bridge_features = f.bridges;
                 if !include_buildings {
                     // nothing to report
                 } else if b.is_empty() {
@@ -219,6 +227,16 @@ pub async fn generate_terrain(
             }
         }
     };
+
+    // Building-tagged bridge supports that carry stacked building:part
+    // elements (Tower Bridge's pier bases under its towers) go back to the
+    // building path, so the parts keep the base they stand on.
+    if include_buildings && !bridge_features.supports.is_empty() {
+        let handed = hand_back_stacked_bases(&mut bridge_features, &mut buildings);
+        if handed > 0 {
+            tracing::info!("   └─ Bridge supports carrying stacked parts kept as buildings: {}", handed);
+        }
+    }
 
     // Contextual height inference: >90% of OSM outlines in typical Italian
     // cities have no height, and the plain per-type default (yes → 8 m,
@@ -248,27 +266,16 @@ pub async fn generate_terrain(
     // preserving the proportions that already look right — while only the extreme
     // outliers above the knee are compressed, so landmarks stay tallest without
     // blowing out the scale.
+    // The knee is computed even when there is too little to compress: bridge
+    // towers go through the same function (see utils::bridges).
+    let (median_height, knee) = crate::services::height_inference::scene_knee(&buildings);
     if buildings.len() >= 8 {
-        const KNEE_MULT: f32 = 3.0;
-        const KNEE_FLOOR_M: f32 = 20.0;
-        const SLOPE: f32 = 0.30;
-
-        // Median over outlines only: a decomposed landmark (St Peter's has dozens
-        // of building:part elements, many of them tall) would otherwise drag the
-        // knee upward and escape compression.
-        let mut sorted: Vec<f32> = buildings.iter().filter(|b| !b.is_part).map(|b| b.height).collect();
-        if sorted.is_empty() {
-            sorted = buildings.iter().map(|b| b.height).collect();
-        }
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = sorted[sorted.len() / 2];
-        let knee = (median * KNEE_MULT).max(KNEE_FLOOR_M);
         let max_before = buildings.iter().map(|b| b.height).fold(0.0f32, f32::max);
 
         // One monotone map applied to every vertical coordinate (top, eave,
         // min_height) keeps stacked building:part solids aligned: the eave of a
         // drum still meets the min_height of the dome above it.
-        let compress = |h: f32| if h > knee { knee + (h - knee) * SLOPE } else { h };
+        let compress = |h: f32| crate::services::height_inference::soft_knee(h, knee);
 
         let mut compressed = 0usize;
         let mut max_after = 0.0f32;
@@ -288,7 +295,7 @@ pub async fn generate_terrain(
         if compressed > 0 {
             tracing::info!(
                 "   └─ Height compression: median {:.0}m, knee {:.0}m → compressed {} element(s); max {:.0}m → {:.0}m",
-                median, knee, compressed, max_before, max_after
+                median_height, knee, compressed, max_before, max_after
             );
         }
     }
@@ -472,6 +479,25 @@ pub async fn generate_terrain(
     );
 
     // ═══════════════════════════════════════════════════════════════
+    // STEP 5c: Bridges — planimetry in metres (decks, groups, supports)
+    // ═══════════════════════════════════════════════════════════════
+    let mut bridge_plan: Option<BridgePlan> = None;
+    if include_bridges && !bridge_features.is_empty() {
+        tracing::info!("─────────────────────────────────────────────────────────────────");
+        tracing::info!("🌉 STEP 5c: Bridges — planimetry");
+        let step_start = std::time::Instant::now();
+        let grid_dim = (resolution + 1) as usize;
+        match BridgePlan::build(&bridge_features, &projector, &projected_points, grid_dim, mm_per_m as f64) {
+            Ok(plan) => {
+                tracing::info!("   ✓ {}", plan.summary());
+                bridge_plan = Some(plan);
+            }
+            Err(e) => tracing::warn!("   ⚠ Bridge planning failed (continuing without bridges): {:#}", e),
+        }
+        tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // STEP 6: Generate 3D terrain mesh using Delaunay triangulation
     // ═══════════════════════════════════════════════════════════════
     tracing::info!("─────────────────────────────────────────────────────────────────");
@@ -531,7 +557,58 @@ pub async fn generate_terrain(
     } else {
         tracing::info!("🏗️  STEP 7/8: Skipping building extrusions (no buildings)");
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 7c: Bridges — profiles on the rendered terrain, decks, piers,
+    // towers (building colour range), then removable print supports
+    // ═══════════════════════════════════════════════════════════════
+    let mut bridge_build: Option<BridgeBuild> = None;
+    if let Some(plan) = &bridge_plan {
+        tracing::info!("─────────────────────────────────────────────────────────────────");
+        tracing::info!("🌉 STEP 7c: Bridges — decks, piers, towers");
+        let step_start = std::time::Instant::now();
+        let surface = TerrainSurface::build(&mesh, terrain_triangle_count, water_triangle_count);
+        let terrain_min_z = mesh.vertices[..terrain_vertex_count]
+            .iter()
+            .map(|v| v[2])
+            .fold(f32::INFINITY, f32::min);
+        let params = SolveParams {
+            building_scale: effective_building_scale as f64,
+            knee,
+            terrain_min_z: terrain_min_z as f64,
+            print_supports: bridge_print_supports,
+        };
+        let mut build = plan.solve(&surface, &params);
+        let triangles_before = mesh.triangles.len();
+        let (ok, rolled_back) = build.emit_structures(&mut mesh);
+        // The bridge solids are the LAST triangles of the building range.
+        build.report["structure_triangles"] = (mesh.triangles.len() - triangles_before).into();
+        build.report["solids_rolled_back"] = rolled_back.into();
+        tracing::info!("   ✓ Bridges: {}", build.summary);
+        tracing::info!(
+            "   └─ {} solid(s), {} triangles{}",
+            ok,
+            mesh.triangles.len() - triangles_before,
+            if rolled_back > 0 { format!(", {rolled_back} rolled back (not closed)") } else { String::new() }
+        );
+        tracing::info!("   ⏱ Step completed in {:.2}ms", step_start.elapsed().as_secs_f64() * 1000.0);
+        bridge_build = Some(build);
+    }
     let building_triangle_count = mesh.triangles.len() - terrain_triangle_count;
+
+    // Removable breakaway columns: their own range, right after the buildings.
+    let mut support_triangle_count = 0;
+    if let Some(build) = &bridge_build {
+        let before = mesh.triangles.len();
+        let (ok, rolled_back) = build.emit_columns(&mut mesh);
+        support_triangle_count = mesh.triangles.len() - before;
+        if ok + rolled_back > 0 {
+            tracing::info!(
+                "   └─ Removable print supports: {} breakaway column(s), {} triangles (top gap {} mm, assumes 0.2 mm layers)",
+                ok, support_triangle_count, crate::utils::bridges::BREAKAWAY_TOP_GAP_MM
+            );
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 7b: Normalize mesh to print dimensions (100mm × 100mm)
@@ -598,9 +675,11 @@ pub async fn generate_terrain(
         hydro.as_ref(),
         water_triangle_count,
         &placements,
+        bridge_build.as_ref().map(|b| &b.report),
         &mesh,
         terrain_triangle_count,
         building_triangle_count,
+        support_triangle_count,
         is_manifold,
     );
     if std::env::var("DEBUG_DUMP_STL").map(|v| v != "0").unwrap_or(false) {
@@ -622,6 +701,7 @@ pub async fn generate_terrain(
         max_elevation: elev_max,
         buildings_count: buildings.len(),
         water_features_count: hydro.as_ref().map_or(0, |h| h.features_used),
+        bridges_count: bridge_build.as_ref().map_or(0, |b| b.emitted),
     };
 
     // Prepare mesh data for frontend rendering.
@@ -633,6 +713,7 @@ pub async fn generate_terrain(
         terrain_triangle_count,
         building_triangle_count,
         water_triangle_count,
+        support_triangle_count,
     };
 
     let total_elapsed = total_start.elapsed();
@@ -645,6 +726,7 @@ pub async fn generate_terrain(
     tracing::info!("   ├─ Total triangles:    {}", stats.triangles);
     tracing::info!("   ├─ Buildings included: {}", stats.buildings_count);
     tracing::info!("   ├─ Water features:     {} ({} water triangles)", stats.water_features_count, water_triangle_count);
+    tracing::info!("   ├─ Bridges:            {} ({} support triangles)", stats.bridges_count, support_triangle_count);
     tracing::info!("   ├─ Area covered:       {:.4} km²", stats.area_km2);
     tracing::info!("   ├─ Elevation range:    {:.1}m to {:.1}m", stats.min_elevation, stats.max_elevation);
     tracing::info!("   └─ Mesh watertight:    {}", if is_manifold { "Yes ✓" } else { "No ⚠" });
@@ -670,9 +752,11 @@ fn write_geometry_report(
     hydro: Option<&HydroModel>,
     water_triangles: usize,
     placements: &[crate::utils::mesh::BuildingPlacement],
+    bridges: Option<&serde_json::Value>,
     mesh: &TerrainMesh,
     terrain_triangles: usize,
     building_triangles: usize,
+    support_triangles: usize,
     is_manifold: bool,
 ) {
     use std::collections::BTreeMap;
@@ -737,12 +821,14 @@ fn write_geometry_report(
             })),
         },
         "water": hydro.map(|h| h.report.clone()),
+        "bridges": bridges,
         "mesh": {
             "vertices": mesh.vertices.len(),
             "triangles": mesh.triangles.len(),
             "terrain_triangles": terrain_triangles,
             "water_triangles": water_triangles,
             "building_triangles": building_triangles,
+            "support_triangles": support_triangles,
             "manifold": is_manifold,
         },
         "tallest_elements": tallest,

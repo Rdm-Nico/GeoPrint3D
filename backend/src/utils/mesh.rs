@@ -86,7 +86,7 @@ fn ring_centroid(pts: &[(f32, f32)]) -> (f32, f32) {
 
 /// True when the triangle set forms a closed 2-manifold surface
 /// (every undirected edge is used by exactly two triangles).
-fn solid_is_closed(triangles: &[[usize; 3]]) -> bool {
+pub(crate) fn solid_is_closed(triangles: &[[usize; 3]]) -> bool {
     let mut edges: std::collections::HashMap<(usize, usize), i32> =
         std::collections::HashMap::with_capacity(triangles.len() * 3 / 2);
     for t in triangles {
@@ -343,6 +343,101 @@ impl TerrainIndex {
             // One extra ring past the first hit guarantees the true nearest.
             if best.is_some() && r >= 1 {
                 break;
+            }
+        }
+        best
+    }
+}
+
+/// Exact height of the RENDERED terrain surface (land and water, mesh units)
+/// at any (x, y): barycentric interpolation inside the triangle containing
+/// the point, found through a uniform bucket grid. Shore walls (zero XY area)
+/// are skipped; on a shoreline edge the land side (the higher one) wins.
+/// The bridge module needs this: a deck must meet the surface as printed, and
+/// `TerrainIndex::nearest_z` next to a shore can return the recessed water
+/// copy of a vertex.
+pub(crate) struct TerrainSurface {
+    tris: Vec<[[f32; 3]; 3]>,
+    water: Vec<bool>,
+    min_x: f32,
+    min_y: f32,
+    inv_cell: f32,
+    nx: usize,
+    ny: usize,
+    buckets: Vec<Vec<u32>>,
+}
+
+impl TerrainSurface {
+    /// Index the terrain triangles `[0, terrain_tc)`; the last `water_tc` of
+    /// them are the water surface.
+    pub(crate) fn build(mesh: &TerrainMesh, terrain_tc: usize, water_tc: usize) -> Self {
+        let mut tris = Vec::with_capacity(terrain_tc);
+        let mut water = Vec::with_capacity(terrain_tc);
+        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+        for (i, t) in mesh.triangles[..terrain_tc].iter().enumerate() {
+            let [a, b, c] = t.map(|k| mesh.vertices[k]);
+            let area2 = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+            if area2.abs() < 1e-6 {
+                continue; // vertical shore wall
+            }
+            for v in [a, b, c] {
+                min_x = min_x.min(v[0]);
+                max_x = max_x.max(v[0]);
+                min_y = min_y.min(v[1]);
+                max_y = max_y.max(v[1]);
+            }
+            tris.push([a, b, c]);
+            water.push(i >= terrain_tc - water_tc.min(terrain_tc));
+        }
+        let span = (max_x - min_x).max(max_y - min_y).max(1.0);
+        let cells = ((tris.len() as f32 / 2.0).sqrt().ceil() as usize).clamp(1, 2048);
+        let inv_cell = cells as f32 / span;
+        let (nx, ny) = (cells + 1, cells + 1);
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); nx * ny];
+        for (i, t) in tris.iter().enumerate() {
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for v in t {
+                x0 = x0.min(v[0]);
+                x1 = x1.max(v[0]);
+                y0 = y0.min(v[1]);
+                y1 = y1.max(v[1]);
+            }
+            let cx0 = (((x0 - min_x) * inv_cell) as usize).min(nx - 1);
+            let cx1 = (((x1 - min_x) * inv_cell) as usize).min(nx - 1);
+            let cy0 = (((y0 - min_y) * inv_cell) as usize).min(ny - 1);
+            let cy1 = (((y1 - min_y) * inv_cell) as usize).min(ny - 1);
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    buckets[cy * nx + cx].push(i as u32);
+                }
+            }
+        }
+        Self { tris, water, min_x, min_y, inv_cell, nx, ny, buckets }
+    }
+
+    /// (surface z, is water) at (x, y), or `None` outside the terrain.
+    pub(crate) fn sample(&self, x: f64, y: f64) -> Option<(f64, bool)> {
+        let (x, y) = (x as f32, y as f32);
+        let fx = (x - self.min_x) * self.inv_cell;
+        let fy = (y - self.min_y) * self.inv_cell;
+        if fx < 0.0 || fy < 0.0 || fx >= self.nx as f32 || fy >= self.ny as f32 {
+            return None;
+        }
+        let cell = (fy as usize) * self.nx + fx as usize;
+        let mut best: Option<(f64, bool)> = None;
+        for &i in &self.buckets[cell] {
+            let [a, b, c] = self.tris[i as usize];
+            let d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+            let l1 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / d;
+            let l2 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / d;
+            let l3 = 1.0 - l1 - l2;
+            const EPS: f32 = -1e-5;
+            if l1 >= EPS && l2 >= EPS && l3 >= EPS {
+                let z = (l1 * a[2] + l2 * b[2] + l3 * c[2]) as f64;
+                if best.map_or(true, |(bz, _)| z > bz) {
+                    best = Some((z, self.water[i as usize]));
+                }
             }
         }
         best
