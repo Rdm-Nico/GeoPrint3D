@@ -1,17 +1,12 @@
-mod api;
-mod models;
-mod services;
-mod utils;
-
-use api::{generate_terrain, health_check, receive_frontend_logs, AppState};
 use axum::{
     routing::{get, post},
     Router,
 };
-use services::{ElevationService, OsmService};
+use geoprint3d_backend::api::{generate_terrain, health_check, receive_frontend_logs, AppState};
+use geoprint3d_backend::services::{ElevationService, OsmService};
+use geoprint3d_backend::utils::{init_logging, FrontendLogWriter};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use utils::{init_logging, FrontendLogWriter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

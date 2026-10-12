@@ -2,6 +2,8 @@
 name = "geoprint3d-backend"
 version = "0.1.0"
 edition = "2021"
+# `cargo run` keeps starting the HTTP server; the city harness is `--bin city_tests`.
+default-run = "geoprint3d-backend"
 
 [dependencies]
 # Web framework
@@ -42,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 chrono = "0.4"
 bytes = "1.5"
+flate2 = "1"  # gzip for the regression-harness snapshots (services::snapshot)
 
 # Async
 futures = "0.3"

@@ -1,0 +1,123 @@
+{
+  "_comment": "Luoghi di test FISSI (bbox e parametri congelati). Non modificare una bbox senza ri-registrare lo snapshot: l'harness la confronta con quella salvata e, se diversa, registra di nuovo i dati. Vedi README.md.",
+  "defaults": {
+    "resolution": 150,
+    "vertical_scale": 2.0,
+    "base_height": 2.0,
+    "print_size": 180.0,
+    "include_buildings": true,
+    "include_water": true,
+    "include_bridges": true,
+    "bridge_print_supports": true
+  },
+  "cities": [
+    {
+      "id": "rome",
+      "name": "Roma — Vaticano, Borgo, Prati, Tevere",
+      "group": "cities",
+      "bbox": { "min_lat": 41.893780, "min_lon": 12.443819, "max_lat": 41.909431, "max_lon": 12.476521 },
+      "source": "run dell'utente 2026-10-12 19:20Z (concepts/Rome_1.png, Rome_2.png)",
+      "views": [
+        { "name": "overview", "az": 200, "el": 35 },
+        { "name": "st_peter", "center": [41.90222, 12.45393], "radius_m": 320, "az": 110, "el": 30 },
+        { "name": "st_peter_profile", "center": [41.90222, 12.45393], "radius_m": 130, "az": 180, "el": 4, "buildings_only": true }
+      ]
+    },
+    {
+      "id": "paris",
+      "name": "Parigi — Tour Eiffel, Champ de Mars, Invalides, Champs-Élysées",
+      "group": "cities",
+      "bbox": { "min_lat": 48.849072, "min_lon": 2.280607, "max_lat": 48.874651, "max_lon": 2.325926 },
+      "source": "run dell'utente 2026-10-12 19:30Z (concepts/Paris_1.png, Paris_2.png)",
+      "views": [
+        { "name": "overview", "az": 200, "el": 35 },
+        { "name": "eiffel", "center": [48.85837, 2.29448], "radius_m": 260, "az": 140, "el": 22 },
+        { "name": "eiffel_profile", "center": [48.85837, 2.29448], "radius_m": 110, "az": 134, "el": 4, "buildings_only": true }
+      ]
+    },
+    {
+      "id": "taj_mahal",
+      "name": "Agra — Taj Mahal, Taj Ganj, Yamuna",
+      "group": "cities",
+      "bbox": { "min_lat": 27.161579, "min_lon": 78.024044, "max_lat": 27.192961, "max_lon": 78.058290 },
+      "source": "run dell'utente 2026-10-12 19:27Z (concepts/Taj_Mahal_1.png, Taj_Mahal_2.png)",
+      "views": [
+        { "name": "overview", "az": 190, "el": 35 },
+        { "name": "taj", "center": [27.17510, 78.04215], "radius_m": 320, "az": 180, "el": 25 },
+        { "name": "taj_profile", "center": [27.17510, 78.04215], "radius_m": 90, "az": 180, "el": 4, "buildings_only": true }
+      ]
+    },
+    {
+      "id": "dubai",
+      "name": "Dubai — Downtown, Burj Khalifa, Business Bay",
+      "group": "cities",
+      "bbox": { "min_lat": 25.175427, "min_lon": 55.268097, "max_lat": 25.213017, "max_lon": 55.309639 },
+      "source": "run dell'utente 2026-10-12 19:34Z (nessuna immagine in concepts/)",
+      "views": [
+        { "name": "overview", "az": 200, "el": 35 },
+        { "name": "burj_khalifa", "center": [25.19720, 55.27440], "radius_m": 450, "az": 200, "el": 20 },
+        { "name": "business_bay", "center": [25.18400, 55.27700], "radius_m": 500, "az": 200, "el": 25 }
+      ]
+    },
+    {
+      "id": "barcelona",
+      "name": "Barcellona — Sagrada Família ed Eixample",
+      "group": "cities",
+      "bbox": { "min_lat": 41.393500, "min_lon": 2.159000, "max_lat": 41.413500, "max_lon": 2.190000 },
+      "source": "creata per la suite 2026-10-12: ~2.2 × 2.6 km centrata sulla Sagrada Família (Eixample = griglia di isolati con cortili)",
+      "views": [
+        { "name": "overview", "az": 200, "el": 40 },
+        { "name": "sagrada_familia", "center": [41.40363, 2.17436], "radius_m": 220, "az": 200, "el": 28 }
+      ]
+    },
+    {
+      "id": "versailles",
+      "name": "Versailles — Château, giardini, Grand Canal, città",
+      "group": "cities",
+      "bbox": { "min_lat": 48.796000, "min_lon": 2.095000, "max_lat": 48.815000, "max_lon": 2.135000 },
+      "source": "creata per la suite 2026-10-12: ~2.1 × 2.9 km, castello + parterre + testata del Grand Canal + città a est",
+      "views": [
+        { "name": "overview", "az": 180, "el": 40 },
+        { "name": "chateau", "center": [48.80490, 2.12040], "radius_m": 380, "az": 250, "el": 30 },
+        { "name": "chateau_plan", "center": [48.80443, 2.12157], "radius_m": 330, "az": 180, "el": 89, "buildings_only": true }
+      ]
+    },
+    {
+      "id": "rome_st_peter",
+      "name": "Close-up — Basilica di San Pietro",
+      "group": "landmark",
+      "bbox": { "min_lat": 41.898200, "min_lon": 12.446700, "max_lat": 41.906200, "max_lon": 12.461100 },
+      "source": "creata per la suite 2026-10-12: ~1.2 × 0.9 km centrata sulla basilica (risoluzione di stampa ~3× la bbox 'rome')",
+      "views": [
+        { "name": "overview", "az": 110, "el": 32 },
+        { "name": "basilica", "center": [41.90222, 12.45393], "radius_m": 200, "az": 110, "el": 25 },
+        { "name": "basilica_side", "center": [41.90222, 12.45393], "radius_m": 200, "az": 200, "el": 12 },
+        { "name": "basilica_profile", "center": [41.90222, 12.45393], "radius_m": 130, "az": 180, "el": 4, "buildings_only": true }
+      ]
+    },
+    {
+      "id": "paris_eiffel",
+      "name": "Close-up — Tour Eiffel",
+      "group": "landmark",
+      "bbox": { "min_lat": 48.854400, "min_lon": 2.288500, "max_lat": 48.862400, "max_lon": 2.300500 },
+      "source": "creata per la suite 2026-10-12: ~0.9 × 0.9 km centrata sulla torre",
+      "views": [
+        { "name": "overview", "az": 140, "el": 30 },
+        { "name": "tower", "center": [48.85837, 2.29448], "radius_m": 160, "az": 140, "el": 15 },
+        { "name": "tower_profile", "center": [48.85837, 2.29448], "radius_m": 110, "az": 134, "el": 4, "buildings_only": true }
+      ]
+    },
+    {
+      "id": "taj_mahal_closeup",
+      "name": "Close-up — Taj Mahal (bbox piccola dell'utente)",
+      "group": "landmark",
+      "bbox": { "min_lat": 27.168757, "min_lon": 78.036017, "max_lat": 27.181852, "max_lon": 78.049278 },
+      "source": "run dell'utente 2026-10-12 19:26Z (prima run Taj Mahal, 1.9 km²)",
+      "views": [
+        { "name": "overview", "az": 180, "el": 35 },
+        { "name": "taj", "center": [27.17510, 78.04215], "radius_m": 160, "az": 180, "el": 20 },
+        { "name": "taj_profile", "center": [27.17510, 78.04215], "radius_m": 90, "az": 180, "el": 4, "buildings_only": true }
+      ]
+    }
+  ]
+}

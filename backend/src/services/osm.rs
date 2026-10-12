@@ -2,7 +2,11 @@ use crate::models::{
     BoundingBox, BridgeFeatures, BridgeKind, BridgeOutline, BridgeSupport, BridgeWay, Building,
     HeightSource, RoofShape, SupportRole, WaterArea, WaterFeatures, WaterKind, Waterway,
 };
+use super::snapshot::{
+    apply_patches, read_gz_json, write_gz_json, OsmRaw, OsmRawOut, RawTileOut, Snapshot, SNAPSHOT_VERSION,
+};
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -97,6 +101,74 @@ pub struct OsmFeatures {
     pub buildings: Vec<Building>,
     pub water: WaterFeatures,
     pub bridges: BridgeFeatures,
+    /// Diagnostics of the fetch (tile sources, failures, filter counters).
+    pub report: FetchReport,
+}
+
+/// Which sources a tile may come from. `Hedged` (the default, and the only
+/// policy the HTTP API uses) races the Overpass mirrors and the OSM direct
+/// API; the other two exist for source-comparison experiments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum SourcePolicy {
+    #[default]
+    Hedged,
+    OverpassOnly,
+    DirectOnly,
+}
+
+/// Fetch knobs the HTTP API never changes (the regression harness does).
+#[derive(Clone, Debug)]
+pub struct FetchConfig {
+    /// Wall-clock budget of the tile phase (default OSM_PHASE_BUDGET).
+    pub budget: Duration,
+    pub source: SourcePolicy,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self { budget: OSM_PHASE_BUDGET, source: SourcePolicy::Hedged }
+    }
+}
+
+/// Diagnostics of one fetch, for the regression harness manifests.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FetchReport {
+    /// `live`, `record` or `replay`.
+    pub mode: String,
+    /// When the raw data was fetched (record / replay only).
+    pub recorded_at: Option<String>,
+    pub tiles: Vec<TileReport>,
+    pub failed_tiles: usize,
+    /// Some tile failed permanently: coverage has holes.
+    pub partial: bool,
+    pub elapsed_s: f64,
+    /// Effective footprint filter (m²).
+    pub min_area_m2: f64,
+    /// Building elements dropped: no geometry, clipped away or below the filter.
+    pub elements_skipped: usize,
+    /// Height provenance counters: [tag, levels, default].
+    pub height_sources: [usize; 3],
+    pub building_relations: usize,
+    /// Outlines replaced by their building:part elements.
+    pub outlines_suppressed: usize,
+    pub water_skipped: usize,
+    pub bridge_skipped: usize,
+    /// Water relations re-fetched whole / still incomplete and dropped.
+    pub relations_refetched: Vec<u64>,
+    pub relations_dropped: Vec<u64>,
+    /// Raw elements touched by snapshot patches (replay experiments).
+    pub patched_elements: usize,
+}
+
+/// One tile attempt (failed attempts are listed too, before their split).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TileReport {
+    pub label: String,
+    pub depth: u8,
+    pub source: String,
+    pub elements: usize,
+    pub elapsed_s: f64,
+    pub error: Option<String>,
 }
 
 // Default widths (m) of linear waterways without a `width` tag.
@@ -206,9 +278,14 @@ impl TileKey {
 /// One tile's raw, still-unparsed response plus provenance. Parsing is
 /// deferred to the ordered merge so the shared dedupe set stays sequential.
 struct FetchedTile {
-    source: &'static str,
+    source: String,
     element_count: usize,
     data: RawTile,
+    /// The response body exactly as received, kept only when recording a
+    /// snapshot: replaying the same bytes through the same parser is
+    /// bit-exact, re-serialising the parsed `Value` is not (serde_json's
+    /// default float parsing is not round-trip exact).
+    body: Option<bytes::Bytes>,
 }
 
 enum RawTile {
@@ -266,6 +343,21 @@ impl OsmService {
         opts: FetchOptions,
         min_area_m2: f64,
     ) -> Result<OsmFeatures> {
+        self.fetch_features_with(bbox, opts, min_area_m2, &FetchConfig::default(), None).await
+    }
+
+    /// `fetch_features` with an explicit time budget / source policy and an
+    /// optional snapshot (record the raw responses, or replay them instead of
+    /// touching the network — see `services::snapshot`). Parsing is identical
+    /// in every mode: the snapshot only changes where the raw bytes come from.
+    pub async fn fetch_features_with(
+        &self,
+        bbox: &BoundingBox,
+        opts: FetchOptions,
+        min_area_m2: f64,
+        cfg: &FetchConfig,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<OsmFeatures> {
         tracing::info!(
             "   ┌─ OpenStreetMap Feature Service (buildings: {}, water: {}, bridges: {})",
             opts.buildings, opts.water, opts.bridges
@@ -278,75 +370,83 @@ impl OsmService {
         tracing::info!("   │  Footprint filter: ≥ {:.0} m² (print-resolution aware)", min_area_m2);
 
         let request_start = Instant::now();
-        let deadline = request_start + OSM_PHASE_BUDGET;
-        let tiles = split_bbox(bbox, TILE_MAX_KM2);
-        if tiles.len() > 1 {
-            tracing::info!(
-                "   │  Large area: split into {} tiles of ≤ {} km² (≤{} concurrent, {}s budget)",
-                tiles.len(), TILE_MAX_KM2, MAX_CONCURRENT_TILES, OSM_PHASE_BUDGET.as_secs()
-            );
-        }
+        let mut report = FetchReport::default();
+        let replay = snapshot.filter(|s| s.is_replay());
+        let record = snapshot.filter(|s| s.is_record());
 
-        // ── Concurrent fan-out ────────────────────────────────────────────────
-        // Every tile is an independent task; a failed tile is quartered and its
-        // sub-tiles re-spawned (smaller queries dodge Overpass stalls and the
-        // OSM-API node limit) until MAX_TILE_SPLIT_DEPTH or budget exhaustion.
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TILES));
-        let mut tasks: JoinSet<TileTask> = JoinSet::new();
-        let client = self.client.clone();
-        let mut seq = 0usize; // rotates the starting mirror per spawned tile
-        let mut spawn_tile = |tasks: &mut JoinSet<TileTask>, key: TileKey, depth: u8, tile: BoundingBox| {
-            let client = client.clone();
-            let semaphore = semaphore.clone();
-            let mirror_seq = seq;
-            seq += 1;
-            tasks.spawn(async move {
-                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-                let result = fetch_tile_raw(&client, &tile, mirror_seq, deadline, opts).await;
-                (key, depth, tile, result)
-            });
-        };
-        for (i, tile) in tiles.into_iter().enumerate() {
-            spawn_tile(&mut tasks, TileKey::root(i), 0, tile);
-        }
-
-        let mut raw_tiles: Vec<(TileKey, FetchedTile)> = Vec::new();
-        let mut failed_tiles = 0usize;
-        while let Some(joined) = tasks.join_next().await {
-            let Ok((key, depth, tile, result)) = joined else {
-                failed_tiles += 1;
-                tracing::warn!("   │  Tile task aborted unexpectedly");
-                continue;
-            };
-            match result {
-                Ok(fetched) => {
-                    tracing::info!(
-                        "   │  Tile {} (depth {}): ok via {} — {} raw elements ({:.1}s)",
-                        key.label(), depth, fetched.source, fetched.element_count,
-                        request_start.elapsed().as_secs_f64()
-                    );
-                    raw_tiles.push((key, fetched));
-                }
-                Err(e) => {
-                    let time_left = deadline.checked_duration_since(Instant::now());
-                    if depth < MAX_TILE_SPLIT_DEPTH && time_left.is_some_and(|t| t >= MIN_SPLIT_BUDGET) {
-                        tracing::warn!(
-                            "   │  Tile {} (depth {}) failed: {:#} — splitting 2×2 and retrying",
-                            key.label(), depth, e
-                        );
-                        for (q, sub) in split_bbox_grid(&tile, 2, 2).into_iter().enumerate() {
-                            spawn_tile(&mut tasks, key.child(depth + 1, q), depth + 1, sub);
-                        }
-                    } else {
-                        failed_tiles += 1;
-                        tracing::warn!(
-                            "   │  Tile {} (depth {}) FAILED permanently: {:#}",
-                            key.label(), depth, e
-                        );
+        // ── Raw tiles: live (concurrent, hedged) or from a snapshot ──────────
+        let mut replayed_relations: Option<BTreeMap<u64, (Value, bytes::Bytes)>> = None;
+        let (mut raw_tiles, mut failed_tiles) = match replay {
+            Some(s) => {
+                report.mode = "replay".into();
+                let raw: OsmRaw = read_gz_json(&s.osm_path())?;
+                anyhow::ensure!(
+                    raw.version == SNAPSHOT_VERSION,
+                    "snapshot {} has version {}, expected {}",
+                    s.osm_path().display(), raw.version, SNAPSHOT_VERSION
+                );
+                anyhow::ensure!(
+                    (!opts.buildings || raw.buildings) && (!opts.water || raw.water) && (!opts.bridges || raw.bridges),
+                    "snapshot {} was recorded without some of the requested feature classes",
+                    s.osm_path().display()
+                );
+                report.recorded_at = Some(raw.recorded_at.clone());
+                tracing::info!(
+                    "   │  Replaying snapshot {} (recorded {}, {} tile(s))",
+                    s.osm_path().display(), raw.recorded_at, raw.tiles.len()
+                );
+                let mut tiles = Vec::with_capacity(raw.tiles.len());
+                for t in raw.tiles {
+                    let mut key = TileKey::root(t.top);
+                    for (i, q) in t.path.iter().take(MAX_TILE_SPLIT_DEPTH as usize).enumerate() {
+                        key.path[i] = *q;
                     }
+                    let mut data: Value = serde_json::from_str(&t.body)
+                        .with_context(|| format!("snapshot tile {}: invalid JSON", key.label()))?;
+                    report.patched_elements += apply_patches(&mut data, &s.patches);
+                    let element_count = data["elements"].as_array().map_or(0, |a| a.len());
+                    report.tiles.push(TileReport {
+                        label: key.label(),
+                        depth: t.path.iter().filter(|&&q| q > 0).count() as u8,
+                        source: t.source.clone(),
+                        elements: element_count,
+                        elapsed_s: 0.0,
+                        error: None,
+                    });
+                    let data = match t.format.as_str() {
+                        "geom" => RawTile::Geom(data),
+                        _ => RawTile::NodeRefs(data),
+                    };
+                    tiles.push((key, FetchedTile { source: t.source, element_count, data, body: None }));
                 }
+                // Injected responses go first: the stable sort below keeps
+                // them ahead of the recorded tile with the same root key.
+                for (k, path) in s.inject.iter().enumerate() {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("reading injected response {}", path.display()))?;
+                    let mut data: Value = serde_json::from_str(&text)
+                        .with_context(|| format!("injected response {}: invalid JSON", path.display()))?;
+                    report.patched_elements += apply_patches(&mut data, &s.patches);
+                    let element_count = data["elements"].as_array().map_or(0, |a| a.len());
+                    let source = format!("inject:{}", path.display());
+                    report.tiles.push(TileReport { label: format!("inject{}", k + 1), source: source.clone(), elements: element_count, ..Default::default() });
+                    tiles.insert(k, (TileKey::root(0), FetchedTile { source, element_count, data: RawTile::NodeRefs(data), body: None }));
+                }
+                let mut relations = BTreeMap::new();
+                for (id, body) in raw.relations {
+                    let mut v: Value = serde_json::from_str(&body)
+                        .with_context(|| format!("snapshot relation {id}: invalid JSON"))?;
+                    report.patched_elements += apply_patches(&mut v, &s.patches);
+                    relations.insert(id, (v, bytes::Bytes::from(body)));
+                }
+                replayed_relations = Some(relations);
+                (tiles, raw.failed_tiles)
             }
-        }
+            None => {
+                report.mode = if record.is_some() { "record" } else { "live" }.into();
+                self.fetch_tiles(bbox, opts, cfg, record.is_some(), request_start, &mut report).await
+            }
+        };
 
         // ── Ordered merge ─────────────────────────────────────────────────────
         // Elements spanning tile borders are returned by every tile they touch;
@@ -358,7 +458,7 @@ impl OsmService {
         let mut out = OsmFeatures::default();
         let mut stats = FetchStats::default();
         let mut ok_tiles = 0usize;
-        for (key, fetched) in raw_tiles {
+        for (key, fetched) in &raw_tiles {
             let mut ctx = ParseCtx {
                 bbox,
                 min_area_m2,
@@ -367,7 +467,7 @@ impl OsmService {
                 out: &mut out,
                 stats: &mut stats,
             };
-            let parsed = match fetched.data {
+            let parsed = match &fetched.data {
                 RawTile::Geom(v) => parse_geom_response(v, &mut ctx),
                 RawTile::NodeRefs(v) => parse_noderefs_response(v, &mut ctx),
             };
@@ -401,32 +501,86 @@ impl OsmService {
                 wanted.entry(p.id).or_insert(p);
             }
         }
+        let mut recorded_relations: BTreeMap<u64, bytes::Bytes> = BTreeMap::new();
         if !wanted.is_empty() {
             tracing::info!("   │  ↻ {} incomplete water relation(s) — fetching whole", wanted.len());
             let ids: Vec<u64> = wanted.keys().copied().collect();
-            let deadline = Instant::now() + RELATION_FALLBACK_BUDGET;
-            let fetched = fetch_full_relations(&self.client, ids, deadline).await;
+            let fetched = match &mut replayed_relations {
+                // Replay never touches the network: a relation the recording
+                // did not need (e.g. after a patch) counts as a failed fetch.
+                Some(saved) => ids
+                    .into_iter()
+                    .map(|id| (id, saved.remove(&id).context("relation not in snapshot")))
+                    .collect::<Vec<_>>(),
+                None => {
+                    let deadline = Instant::now() + RELATION_FALLBACK_BUDGET;
+                    fetch_full_relations(&self.client, ids, deadline).await
+                }
+            };
             let mut ctx = ParseCtx { bbox, min_area_m2, opts, seen: &mut seen, out: &mut out, stats: &mut stats };
             for (id, data) in fetched {
                 match data {
-                    Ok(v) => recover_relation(&mut ctx, &wanted[&id], &v),
+                    Ok((v, body)) => {
+                        recover_relation(&mut ctx, &wanted[&id], &v);
+                        if record.is_some() {
+                            recorded_relations.insert(id, body);
+                        }
+                    }
                     Err(e) => tracing::warn!("   │  Relation {} fetch FAILED: {:#}", id, e),
                 }
             }
             for (id, p) in &wanted {
                 if !seen.contains(&(true, *id)) {
                     stats.water_skipped += 1;
+                    report.relations_dropped.push(*id);
                     tracing::warn!(
                         "   │  ⚠ water relation {} ({}) still incomplete — dropped",
                         id, p.tags["name"].as_str().unwrap_or("unnamed")
                     );
+                } else {
+                    report.relations_refetched.push(*id);
                 }
             }
         }
 
+        if let Some(s) = record {
+            fn text(b: &Option<bytes::Bytes>) -> Result<&str> {
+                let b = b.as_ref().context("recording without the raw response body")?;
+                std::str::from_utf8(b).context("OSM response is not UTF-8")
+            }
+            let mut tiles_out = Vec::with_capacity(raw_tiles.len());
+            for (key, t) in &raw_tiles {
+                let format = match &t.data {
+                    RawTile::Geom(_) => "geom",
+                    RawTile::NodeRefs(_) => "noderefs",
+                };
+                tiles_out.push(RawTileOut { top: key.top, path: key.path.to_vec(), source: &t.source, format, body: text(&t.body)? });
+            }
+            let mut relations_out = BTreeMap::new();
+            for (id, b) in &recorded_relations {
+                relations_out.insert(*id, std::str::from_utf8(b).context("relation response is not UTF-8")?);
+            }
+            let out_raw = OsmRawOut {
+                version: SNAPSHOT_VERSION,
+                recorded_at: chrono::Utc::now().to_rfc3339(),
+                bbox,
+                buildings: opts.buildings,
+                water: opts.water,
+                bridges: opts.bridges,
+                failed_tiles,
+                tiles: tiles_out,
+                relations: relations_out,
+            };
+            report.recorded_at = Some(out_raw.recorded_at.clone());
+            write_gz_json(&s.osm_path(), &out_raw)?;
+            tracing::info!("   │  Snapshot recorded: {}", s.osm_path().display());
+        }
+        drop(raw_tiles);
+
         let mut buildings = std::mem::take(&mut out.buildings);
+        let mut suppressed = 0;
         if opts.buildings {
-            let suppressed = suppress_covered_outlines(&mut buildings);
+            suppressed = suppress_covered_outlines(&mut buildings);
             log_building_stats(&buildings, &stats.src, stats.relations, suppressed);
         }
         if opts.water {
@@ -436,11 +590,125 @@ impl OsmService {
             log_bridge_stats(&out.bridges, stats.bridge_skipped);
         }
         tracing::info!("   └─ OSM processing time: {:.2}s", request_start.elapsed().as_secs_f64());
+
+        report.failed_tiles = failed_tiles;
+        report.partial = failed_tiles > 0;
+        report.elapsed_s = request_start.elapsed().as_secs_f64();
+        report.min_area_m2 = min_area_m2;
+        report.elements_skipped = stats.src.skipped;
+        report.height_sources = [stats.src.tag, stats.src.levels, stats.src.default];
+        report.building_relations = stats.relations;
+        report.outlines_suppressed = suppressed;
+        report.water_skipped = stats.water_skipped;
+        report.bridge_skipped = stats.bridge_skipped;
         Ok(OsmFeatures {
             buildings,
             water: std::mem::take(&mut out.water),
             bridges: std::mem::take(&mut out.bridges),
+            report,
         })
+    }
+
+    /// Concurrent, hedged fetch of every tile of `bbox` (see `fetch_features`).
+    /// Returns the raw responses (unsorted) and the number of tiles that
+    /// failed permanently.
+    async fn fetch_tiles(
+        &self,
+        bbox: &BoundingBox,
+        opts: FetchOptions,
+        cfg: &FetchConfig,
+        keep_body: bool,
+        request_start: Instant,
+        report: &mut FetchReport,
+    ) -> (Vec<(TileKey, FetchedTile)>, usize) {
+        let deadline = request_start + cfg.budget;
+        let source = cfg.source;
+        let tiles = split_bbox(bbox, TILE_MAX_KM2);
+        if tiles.len() > 1 {
+            tracing::info!(
+                "   │  Large area: split into {} tiles of ≤ {} km² (≤{} concurrent, {}s budget)",
+                tiles.len(), TILE_MAX_KM2, MAX_CONCURRENT_TILES, cfg.budget.as_secs()
+            );
+        }
+
+        // ── Concurrent fan-out ────────────────────────────────────────────────
+        // Every tile is an independent task; a failed tile is quartered and its
+        // sub-tiles re-spawned (smaller queries dodge Overpass stalls and the
+        // OSM-API node limit) until MAX_TILE_SPLIT_DEPTH or budget exhaustion.
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TILES));
+        let mut tasks: JoinSet<TileTask> = JoinSet::new();
+        let client = self.client.clone();
+        let mut seq = 0usize; // rotates the starting mirror per spawned tile
+        let mut spawn_tile = |tasks: &mut JoinSet<TileTask>, key: TileKey, depth: u8, tile: BoundingBox| {
+            let client = client.clone();
+            let semaphore = semaphore.clone();
+            let mirror_seq = seq;
+            seq += 1;
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+                let result = fetch_tile_raw(&client, &tile, mirror_seq, deadline, opts, source, keep_body).await;
+                (key, depth, tile, result)
+            });
+        };
+        for (i, tile) in tiles.into_iter().enumerate() {
+            spawn_tile(&mut tasks, TileKey::root(i), 0, tile);
+        }
+
+        let mut raw_tiles: Vec<(TileKey, FetchedTile)> = Vec::new();
+        let mut failed_tiles = 0usize;
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((key, depth, tile, result)) = joined else {
+                failed_tiles += 1;
+                tracing::warn!("   │  Tile task aborted unexpectedly");
+                continue;
+            };
+            let elapsed_s = request_start.elapsed().as_secs_f64();
+            match result {
+                Ok(fetched) => {
+                    tracing::info!(
+                        "   │  Tile {} (depth {}): ok via {} — {} raw elements ({:.1}s)",
+                        key.label(), depth, fetched.source, fetched.element_count,
+                        elapsed_s
+                    );
+                    report.tiles.push(TileReport {
+                        label: key.label(),
+                        depth,
+                        source: fetched.source.clone(),
+                        elements: fetched.element_count,
+                        elapsed_s,
+                        error: None,
+                    });
+                    raw_tiles.push((key, fetched));
+                }
+                Err(e) => {
+                    report.tiles.push(TileReport {
+                        label: key.label(),
+                        depth,
+                        source: String::new(),
+                        elements: 0,
+                        elapsed_s,
+                        error: Some(format!("{e:#}")),
+                    });
+                    let time_left = deadline.checked_duration_since(Instant::now());
+                    if depth < MAX_TILE_SPLIT_DEPTH && time_left.is_some_and(|t| t >= MIN_SPLIT_BUDGET) {
+                        tracing::warn!(
+                            "   │  Tile {} (depth {}) failed: {:#} — splitting 2×2 and retrying",
+                            key.label(), depth, e
+                        );
+                        for (q, sub) in split_bbox_grid(&tile, 2, 2).into_iter().enumerate() {
+                            spawn_tile(&mut tasks, key.child(depth + 1, q), depth + 1, sub);
+                        }
+                    } else {
+                        failed_tiles += 1;
+                        tracing::warn!(
+                            "   │  Tile {} (depth {}) FAILED permanently: {:#}",
+                            key.label(), depth, e
+                        );
+                    }
+                }
+            }
+        }
+        (raw_tiles, failed_tiles)
     }
 }
 
@@ -661,7 +929,7 @@ fn bridge_name(tags: &Value) -> Option<String> {
 /// Parse an Overpass `out geom` response.
 /// Ways carry a `geometry` array with inline lat/lon objects; relations carry
 /// per-member geometry with `outer`/`inner` roles.
-fn parse_geom_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
+fn parse_geom_response(data: &Value, ctx: &mut ParseCtx) -> Result<()> {
     let elements = data["elements"]
         .as_array()
         .context("Missing 'elements' in Overpass response")?;
@@ -716,7 +984,7 @@ fn parse_geom_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
 /// members of a relation that lie outside the bbox, so large water
 /// multipolygons can arrive incomplete — their open rings are dropped by
 /// `assemble_rings` (partial coverage, never wrong geometry).
-fn parse_noderefs_response(data: Value, ctx: &mut ParseCtx) -> Result<()> {
+fn parse_noderefs_response(data: &Value, ctx: &mut ParseCtx) -> Result<()> {
     let elements = data["elements"]
         .as_array()
         .context("Missing 'elements' in OSM API response")?;
@@ -1019,9 +1287,9 @@ async fn fetch_full_relations(
     client: &reqwest::Client,
     ids: Vec<u64>,
     deadline: Instant,
-) -> Vec<(u64, Result<Value>)> {
+) -> Vec<(u64, Result<(Value, bytes::Bytes)>)> {
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TILES));
-    let mut tasks: JoinSet<(u64, Result<Value>)> = JoinSet::new();
+    let mut tasks: JoinSet<(u64, Result<(Value, bytes::Bytes)>)> = JoinSet::new();
     for id in ids {
         let client = client.clone();
         let semaphore = semaphore.clone();
@@ -1041,7 +1309,7 @@ async fn fetch_full_relations(
 }
 
 /// One `relation/{id}/full` request, clamped to the fallback window.
-async fn fetch_full_relation(client: &reqwest::Client, id: u64, deadline: Instant) -> Result<Value> {
+async fn fetch_full_relation(client: &reqwest::Client, id: u64, deadline: Instant) -> Result<(Value, bytes::Bytes)> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .context("relation fetch budget exhausted")?;
@@ -1055,7 +1323,9 @@ async fn fetch_full_relation(client: &reqwest::Client, id: u64, deadline: Instan
     if !resp.status().is_success() {
         anyhow::bail!("OSM API: HTTP {}", resp.status());
     }
-    resp.json().await.context("OSM API: invalid relation JSON")
+    let body = resp.bytes().await.context("OSM API: invalid relation JSON")?;
+    let value = serde_json::from_slice(&body).context("OSM API: invalid relation JSON")?;
+    Ok((value, body))
 }
 
 /// Apply a re-fetched water relation. Only the relation element itself is
@@ -1114,27 +1384,30 @@ async fn fetch_tile_raw(
     seq: usize,
     deadline: Instant,
     opts: FetchOptions,
+    source: SourcePolicy,
+    keep_body: bool,
 ) -> Result<FetchedTile> {
     let overpass_query = overpass_query(tile, opts);
 
     let n_mirrors = OVERPASS_ENDPOINTS.len();
     let mut attempts: JoinSet<Result<FetchedTile>> = JoinSet::new();
-    for k in 0..n_mirrors {
-        let endpoint = OVERPASS_ENDPOINTS[(seq + k) % n_mirrors];
-        attempts.spawn(overpass_attempt(
-            client.clone(),
-            endpoint,
-            overpass_query.clone(),
-            HEDGE_DELAY * k as u32,
-            deadline,
-        ));
+    if source != SourcePolicy::DirectOnly {
+        for k in 0..n_mirrors {
+            let endpoint = OVERPASS_ENDPOINTS[(seq + k) % n_mirrors];
+            attempts.spawn(overpass_attempt(
+                client.clone(),
+                endpoint,
+                overpass_query.clone(),
+                HEDGE_DELAY * k as u32,
+                deadline,
+                keep_body,
+            ));
+        }
     }
-    attempts.spawn(direct_api_attempt(
-        client.clone(),
-        tile.clone(),
-        HEDGE_DELAY * n_mirrors as u32,
-        deadline,
-    ));
+    if source != SourcePolicy::OverpassOnly {
+        let delay = if source == SourcePolicy::DirectOnly { Duration::ZERO } else { HEDGE_DELAY * n_mirrors as u32 };
+        attempts.spawn(direct_api_attempt(client.clone(), tile.clone(), delay, deadline, keep_body));
+    }
 
     let mut errors: Vec<String> = Vec::new();
     while let Some(joined) = attempts.join_next().await {
@@ -1204,6 +1477,7 @@ async fn overpass_attempt(
     query: String,
     delay: Duration,
     deadline: Instant,
+    keep_body: bool,
 ) -> Result<FetchedTile> {
     tokio::time::sleep(delay).await;
     let remaining = deadline
@@ -1223,10 +1497,10 @@ async fn overpass_attempt(
         // 429/406 = rate-limited or rejected; anything else is a server error.
         anyhow::bail!("{}: HTTP {}", endpoint, status);
     }
-    let data: Value = resp
-        .json()
-        .await
-        .with_context(|| format!("{endpoint}: invalid JSON"))?;
+    // Same as `resp.json()` (bytes, then serde_json::from_slice), keeping
+    // the bytes for snapshot recording.
+    let body = resp.bytes().await.with_context(|| format!("{endpoint}: invalid JSON"))?;
+    let data: Value = serde_json::from_slice(&body).with_context(|| format!("{endpoint}: invalid JSON"))?;
     // Overpass reports server-side timeout/OOM as 200 + remark + a TRUNCATED
     // element list — accepting it would silently punch holes in the coverage,
     // so treat it as a failure (the tile gets hedged elsewhere or split).
@@ -1240,9 +1514,10 @@ async fn overpass_attempt(
         .map(|a| a.len())
         .with_context(|| format!("{endpoint}: missing 'elements'"))?;
     Ok(FetchedTile {
-        source: endpoint,
+        source: endpoint.to_string(),
         element_count,
         data: RawTile::Geom(data),
+        body: keep_body.then_some(body),
     })
 }
 
@@ -1255,6 +1530,7 @@ async fn direct_api_attempt(
     tile: BoundingBox,
     delay: Duration,
     deadline: Instant,
+    keep_body: bool,
 ) -> Result<FetchedTile> {
     tokio::time::sleep(delay).await;
     let remaining = deadline
@@ -1279,15 +1555,17 @@ async fn direct_api_attempt(
     if !status.is_success() {
         anyhow::bail!("OSM API: HTTP {}", status);
     }
-    let data: Value = resp.json().await.context("OSM API: invalid JSON")?;
+    let body = resp.bytes().await.context("OSM API: invalid JSON")?;
+    let data: Value = serde_json::from_slice(&body).context("OSM API: invalid JSON")?;
     let element_count = data["elements"]
         .as_array()
         .map(|a| a.len())
         .context("OSM API: missing 'elements'")?;
     Ok(FetchedTile {
-        source: "OSM direct API",
+        source: "OSM direct API".to_string(),
         element_count,
         data: RawTile::NodeRefs(data),
+        body: keep_body.then_some(body),
     })
 }
 
@@ -1994,9 +2272,9 @@ mod tests {
         let mut stats = FetchStats::default();
         let mut ctx = ParseCtx { bbox: &b, min_area_m2: 10.0, opts: ALL, seen: &mut seen, out: &mut out, stats: &mut stats };
         if noderefs {
-            parse_noderefs_response(data, &mut ctx).unwrap();
+            parse_noderefs_response(&data, &mut ctx).unwrap();
         } else {
-            parse_geom_response(data, &mut ctx).unwrap();
+            parse_geom_response(&data, &mut ctx).unwrap();
         }
         out
     }

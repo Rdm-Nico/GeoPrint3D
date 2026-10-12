@@ -164,6 +164,82 @@ l'impalcato (clearance), non l'altezza.
 
 ---
 
+## Edifici e landmark (analisi del 2026-10-12)
+
+Prove, numeri e figure: [`backend/tests/cities/ANALISI.md`](backend/tests/cities/ANALISI.md).
+Ogni voce si può verificare con l'harness `backend/tests/cities/run.sh`
+(snapshot dei dati del 12/10 + esperimenti sui dati). Niente di questo è
+ancora implementato: la pipeline è invariata.
+
+### P1. Relazioni-edificio incomplete: ricaricarle intere (priorità alta)
+
+**Sintomo.** Il Château de Versailles (relazione 1149002), il Grand Trianon e
+il Dubai Mall (18195959, 248.182 m²) spariscono del tutto; il Palais de
+Chaillot perde 7.454 m²; 68 altre relazioni perdono cortili o pezzi.
+**Causa.** In `osm.rs::push_multipolygon` le relazioni `Building` marcano
+l'id come visto alla prima copia e scartano gli anelli aperti. L'API diretta
+OSM restituisce solo i membri dentro il tile, quindi le relazioni a cavallo
+tra tile arrivano incomplete. Una copia completa di un tile successivo (da
+Overpass) viene ignorata.
+**Correzione.** Usare lo stesso schema già adottato per l'acqua in 7678459
+(`Gate::Strict` + `FetchStats.pending` + `relation/{id}/full.json`).
+Simulata con `inject` in `experiments.json`: castello e mall ricompaiono.
+
+### P2. Regola outline / `building:part` v2 + parser con la virgola (insieme)
+
+**Sintomo.** La Torre Eiffel diventa una piramide piena (le part coprono a
+terra il 25% < 55%, mentre la loro unione copre il 100%) e così pure l'Arc de
+Triomphe. A San Pietro (`height="136,5"` dal 22/09) la cupola resta sospesa;
+leggere la virgola da solo la farebbe inghiottire da un blocco di 136 m.
+**Proposta.** La regola v2 è descritta in ANALISI §6, con prototipo in
+`analysis/audit.py::classify_outline`:
+- nascondere l'outline se l'unione delle part copre ≥ 75% e nessuna part
+  grande è sospesa;
+- usare l'outline come plinto alto F se ci sono part grandi sospese;
+- marcare i casi ambigui "da verificare".
+Simulata su tutti i luoghi (cambiano 12 outline). Limiti noti: Braccio di
+Costantino diventa una lastra in parte sospesa; l'Arc de Triomphe e la
+torre+podio `way/1041684723` di Dubai restano senza regola.
+
+### P3. `roof:direction` e `building:part=roof`
+
+`mesh.rs::skillion_heights` mette il lato basso sul lato più lungo
+dell'impronta, ignorando `roof:direction` (direzione della pendenza dal colmo
+alla gronda). Il tetto inoltre non supera l'80% dell'altezza, quindi le part
+`roof` (solo tetto) ricevono pareti. Serve per le gambe della Eiffel: senza
+questa correzione, nascondere l'outline porta i solidi sospesi da 4 a 16.
+
+### P4. Part alte e sottili sotto la risoluzione (scelta da fare)
+
+I minareti del Taj Mahal (4 anelli da circa 32 m² per relazione) spariscono
+sulle bbox grandi: il filtro per anello è corretto dal punto di vista della
+stampabilità (0,29 mm). Alternativa: allargarli alla larghezza minima
+stampabile quando sono alti. Si tratta di scegliere tra fedeltà e
+stampabilità.
+
+### P5. Knee applicato a ogni landmark come corpo rigido
+
+Il soft-knee comprime ogni altezza sopra 3 × la mediana, e così schiaccia le
+proporzioni interne dei landmark composti: nel Taj il rapporto tra altezza
+totale e corpo passa da 2,0 a 1,3. A Dubai la mediana è dominata dalle
+altezze di default (8,8 m), quindi vengono compressi 470 edifici. Idea: un
+unico fattore per tutte le part di un gruppo S3DB e una mediana calcolata
+solo sulle altezze non di default.
+
+### P6. Estrudere solo il resto dell'outline
+
+A Barcellona 1.187 outline (part da catasto, copertura mediana 15%) sono
+estrusi all'altezza massima e nascondono i volumi bassi interni agli isolati.
+Idea: estrudere outline − unione delle part (booleane `geo`).
+
+### P7. Impronte ML dove OSM è scarso
+
+Taj Ganj ha in OSM lo 0,9% degli edifici rilevati da Google e Microsoft
+(Overture Maps 2026-09-23.1: 24 contro 2.662). A Roma la quota OSM è 98,7%.
+Servono un accesso efficiente a GeoParquet/S3 e altezze stimate.
+
+---
+
 ## Da verificare / note
 
 - **Mirror Overpass instabili.** Il 2026-10-08 i mirror rispondevano 500/429
@@ -192,3 +268,12 @@ l'impalcato (clearance), non l'altezza.
   viene stimato dal DEM, che a Venezia è di tipo DSM. Collegato al punto 1.
 - **Performance della laguna.** Lo step 5b su Venezia resta sotto 1,5 s con
   circa 1.100 buchi; da ricontrollare se cambia la soglia di affidabilità.
+- **Non-determinismo nei ponti (trovato 2026-10-12).** Rigiocando gli stessi
+  dati di Dubai, 2.624 triangoli dei ponti si spostano di al massimo
+  4,8·10⁻⁷ mm (1 ULP) da una run all'altra. Probabile causa: ordine di
+  iterazione delle `HashMap` in `utils/bridges.rs`. È innocuo per la stampa,
+  ma impedisce il confronto bit per bit (`tests/cities/analysis/compare_runs.py`
+  lo tollera).
+- **Crateri attorno a vasche e stagni.** A Versailles (bacini dei giardini) e
+  a Barcellona (stagno di Plaça de Gaudí) l'acqua è incassata in crateri con
+  bordi seghettati. Non è stato analizzato.

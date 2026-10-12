@@ -48,11 +48,21 @@ impl ElevationService {
         bbox: &BoundingBox,
         resolution: u32,
     ) -> Result<Vec<ElevationPoint>> {
+        self.fetch_elevation_grid_with_source(bbox, resolution).await.map(|(points, _)| points)
+    }
+
+    /// `fetch_elevation_grid` plus the name of the source that answered
+    /// (`mapbox` or `open-elevation`), for diagnostics.
+    pub async fn fetch_elevation_grid_with_source(
+        &self,
+        bbox: &BoundingBox,
+        resolution: u32,
+    ) -> Result<(Vec<ElevationPoint>, &'static str)> {
         if let Some(token) = &self.mapbox_token {
             match super::elevation_mapbox::fetch_mapbox_grid(&self.client, token, bbox, resolution)
                 .await
             {
-                Ok(points) => return Ok(points),
+                Ok(points) => return Ok((points, "mapbox")),
                 Err(e) => {
                     tracing::warn!(
                         "   ⚠ Mapbox elevation failed ({}) — falling back to Open-Elevation",
@@ -61,7 +71,7 @@ impl ElevationService {
                 }
             }
         }
-        self.fetch_open_elevation_grid(bbox, resolution).await
+        Ok((self.fetch_open_elevation_grid(bbox, resolution).await?, "open-elevation"))
     }
 
     /// Fetch elevation data from the free Open-Elevation API (coarse SRTM).

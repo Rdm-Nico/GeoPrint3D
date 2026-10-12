@@ -2,12 +2,13 @@ use crate::models::{
     BoundingBox, BridgeFeatures, Building, GenerateRequest, GenerateResponse, MeshData, MeshStats,
     TerrainMesh, WaterFeatures,
 };
-use crate::services::osm::FetchOptions;
+use crate::services::osm::{FetchConfig, FetchOptions, FetchReport};
+use crate::services::snapshot::{read_gz_json, write_gz_json, ElevationRaw, Snapshot};
 use crate::services::water::{assemble_sea, SeaOutcome};
 use crate::services::{ElevationService, OsmService};
 use crate::utils::bridges::{hand_back_stacked_bases, BridgeBuild, BridgePlan, SolveParams};
 use crate::utils::hydro::{HydroModel, WATER_RECESS_MM};
-use crate::utils::mesh::TerrainSurface;
+use crate::utils::mesh::{BuildingPlacement, TerrainSurface};
 use crate::utils::{
     CoordinateProjector, FrontendLogBatch, FrontendLogWriter, MeshExporter, MeshGenerator,
 };
@@ -17,6 +18,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct AppState {
@@ -63,11 +66,92 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl ApiError {
+    pub fn message(&self) -> &str {
+        match self {
+            ApiError::BadRequest(m) | ApiError::InternalError(m) => m,
+        }
+    }
+}
+
+/// Knobs of one generation that the HTTP API never changes; the city
+/// regression harness (`bin/city_tests`) does.
+pub struct GenerateOptions {
+    /// Record the raw inputs, or replay them instead of the network
+    /// (see `services::snapshot`).
+    pub snapshot: Option<Snapshot>,
+    /// Where the geometry debug report goes.
+    pub geometry_report_path: PathBuf,
+    /// OSM tile-phase budget and source policy.
+    pub fetch: FetchConfig,
+}
+
+impl Default for GenerateOptions {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            geometry_report_path: PathBuf::from("logs/last_geometry.json"),
+            fetch: FetchConfig::default(),
+        }
+    }
+}
+
+/// Scaling decisions of one generation (diagnostics for the harness).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScaleReport {
+    pub scene_mode: String,
+    pub xy_range_m: f32,
+    pub mm_per_m: f32,
+    pub relief_m: f32,
+    pub terrain_scale: f32,
+    pub building_scale: f32,
+    pub typical_building_m: f32,
+    pub median_height_m: f32,
+    pub knee_m: f32,
+    /// Elements whose height went through the soft knee.
+    pub compressed: usize,
+    pub max_height_before_m: f32,
+    pub max_height_after_m: f32,
+}
+
+/// Everything one generation produced: the HTTP response plus the
+/// intermediate data the regression harness inspects.
+pub struct GenerateOutput {
+    pub response: GenerateResponse,
+    /// Final mesh in mm (base included), the same triangles as the response.
+    pub mesh: TerrainMesh,
+    /// Buildings as extruded (after inference and knee compression),
+    /// index-aligned with `placements`.
+    pub buildings: Vec<Building>,
+    pub placements: Vec<BuildingPlacement>,
+    pub fetch_report: Option<FetchReport>,
+    pub elevation_source: String,
+    pub scale: ScaleReport,
+}
+
 /// Main handler for generating 3D terrain models
 pub async fn generate_terrain(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, ApiError> {
+    let out = generate(
+        &state.elevation_service,
+        &state.osm_service,
+        request,
+        &GenerateOptions::default(),
+    )
+    .await?;
+    Ok(Json(out.response))
+}
+
+/// The whole generation pipeline: elevation → OSM → scaling → terrain mesh →
+/// buildings → bridges → print normalization → base → manifold check.
+pub async fn generate(
+    elevation_service: &ElevationService,
+    osm_service: &OsmService,
+    request: GenerateRequest,
+    options: &GenerateOptions,
+) -> Result<GenerateOutput, ApiError> {
     let total_start = std::time::Instant::now();
 
     tracing::info!("╔══════════════════════════════════════════════════════════════╗");
@@ -135,18 +219,43 @@ pub async fn generate_terrain(
     tracing::info!("   └─ This step makes an HTTP request to external API...");
     let step_start = std::time::Instant::now();
 
-    let mut elevation_points = state
-        .elevation_service
-        .fetch_elevation_grid(&request.bbox, resolution)
-        .await
-        .map_err(|e| {
-            tracing::error!("   ✗ FAILED to fetch elevation data: {}", e);
-            tracing::error!("   └─ Possible causes:");
-            tracing::error!("      • Open-Elevation API is down or unreachable");
-            tracing::error!("      • Network connectivity issues");
-            tracing::error!("      • Request timeout (too many points)");
-            ApiError::InternalError(format!("Failed to fetch elevation data: {}", e))
-        })?;
+    let snapshot = options.snapshot.as_ref();
+    let (mut elevation_points, elevation_source) = match snapshot.filter(|s| s.is_replay()) {
+        Some(s) => {
+            let raw: ElevationRaw = read_gz_json(&s.elevation_path()).map_err(|e| {
+                ApiError::InternalError(format!("Failed to read elevation snapshot: {e:#}"))
+            })?;
+            if raw.resolution != resolution {
+                return Err(ApiError::BadRequest(format!(
+                    "elevation snapshot has resolution {}, request asks for {}",
+                    raw.resolution, resolution
+                )));
+            }
+            tracing::info!(
+                "   └─ Replaying elevation snapshot {} (recorded {}, source {})",
+                s.elevation_path().display(), raw.recorded_at, raw.source
+            );
+            (raw.points(), raw.source)
+        }
+        None => {
+            let (points, source) = elevation_service
+                .fetch_elevation_grid_with_source(&request.bbox, resolution)
+                .await
+                .map_err(|e| {
+                    tracing::error!("   ✗ FAILED to fetch elevation data: {}", e);
+                    tracing::error!("   └─ Possible causes:");
+                    tracing::error!("      • Open-Elevation API is down or unreachable");
+                    tracing::error!("      • Network connectivity issues");
+                    tracing::error!("      • Request timeout (too many points)");
+                    ApiError::InternalError(format!("Failed to fetch elevation data: {}", e))
+                })?;
+            if let Some(s) = snapshot.filter(|s| s.is_record()) {
+                write_gz_json(&s.elevation_path(), &ElevationRaw::new(&request.bbox, resolution, source, &points))
+                    .map_err(|e| ApiError::InternalError(format!("Failed to record elevation snapshot: {e:#}")))?;
+            }
+            (points, source.to_string())
+        }
+    };
 
     if elevation_points.is_empty() {
         tracing::error!("   ✗ API returned empty elevation data");
@@ -192,6 +301,7 @@ pub async fn generate_terrain(
     // Buildings, water and bridges travel in ONE Overpass query per tile.
     let mut water_features = WaterFeatures::default();
     let mut bridge_features = BridgeFeatures::default();
+    let mut fetch_report: Option<FetchReport> = None;
     let mut buildings = if !include_buildings && !include_water && !include_bridges {
         tracing::info!("🏢 STEP 4/8: Skipping OSM data (buildings, water and bridges disabled by user)");
         Vec::new()
@@ -203,11 +313,15 @@ pub async fn generate_terrain(
         tracing::info!("   └─ This step makes an HTTP request to Overpass API...");
 
         let opts = FetchOptions { buildings: include_buildings, water: include_water, bridges: include_bridges };
-        match state.osm_service.fetch_features(&request.bbox, opts, min_building_area_m2).await {
+        match osm_service
+            .fetch_features_with(&request.bbox, opts, min_building_area_m2, &options.fetch, snapshot)
+            .await
+        {
             Ok(f) => {
                 let b = f.buildings;
                 water_features = f.water;
                 bridge_features = f.bridges;
+                fetch_report = Some(f.report);
                 if !include_buildings {
                     // nothing to report
                 } else if b.is_empty() {
@@ -269,6 +383,7 @@ pub async fn generate_terrain(
     // The knee is computed even when there is too little to compress: bridge
     // towers go through the same function (see utils::bridges).
     let (median_height, knee) = crate::services::height_inference::scene_knee(&buildings);
+    let mut scale_report = ScaleReport { median_height_m: median_height, knee_m: knee, ..Default::default() };
     if buildings.len() >= 8 {
         let max_before = buildings.iter().map(|b| b.height).fold(0.0f32, f32::max);
 
@@ -298,6 +413,9 @@ pub async fn generate_terrain(
                 median_height, knee, compressed, max_before, max_after
             );
         }
+        scale_report.compressed = compressed;
+        scale_report.max_height_before_m = max_before;
+        scale_report.max_height_after_m = max_after;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -464,6 +582,14 @@ pub async fn generate_terrain(
     // are metres × scale before normalisation, i.e. mm / mm_per_m).
     const MIN_BUILDING_PRINT_MM: f32 = 0.6;
     let min_building_z = MIN_BUILDING_PRINT_MM / mm_per_m;
+
+    scale_report.scene_mode = scene_mode.to_string();
+    scale_report.xy_range_m = xy_range_m;
+    scale_report.mm_per_m = mm_per_m;
+    scale_report.relief_m = relief_m;
+    scale_report.terrain_scale = effective_terrain_scale;
+    scale_report.building_scale = effective_building_scale;
+    scale_report.typical_building_m = typical_building_m;
 
     tracing::info!("─────────────────────────────────────────────────────────────────");
     tracing::info!("📐 Scaling model ({} scene):", scene_mode);
@@ -669,6 +795,7 @@ pub async fn generate_terrain(
     // Debug artifacts: geometry report (always) + STL dump (env-gated)
     // ═══════════════════════════════════════════════════════════════
     write_geometry_report(
+        &options.geometry_report_path,
         &request.bbox,
         &buildings,
         inference_report.as_ref(),
@@ -735,10 +862,18 @@ pub async fn generate_terrain(
         mesh_data.vertices.len(), mesh_data.triangles.len());
     tracing::info!("═════════════════════════════════════════════════════════════════");
 
-    Ok(Json(GenerateResponse {
-        stats,
-        mesh_data,
-    }))
+    Ok(GenerateOutput {
+        response: GenerateResponse {
+            stats,
+            mesh_data,
+        },
+        mesh,
+        buildings,
+        placements,
+        fetch_report,
+        elevation_source,
+        scale: scale_report,
+    })
 }
 
 /// Write a per-generation geometry report to `logs/last_geometry.json` so the
@@ -746,6 +881,7 @@ pub async fn generate_terrain(
 /// building:part / courtyard counts, the tallest elements, and mesh integrity.
 #[allow(clippy::too_many_arguments)]
 fn write_geometry_report(
+    path: &Path,
     bbox: &BoundingBox,
     buildings: &[Building],
     inference: Option<&crate::services::height_inference::InferenceReport>,
@@ -837,10 +973,10 @@ fn write_geometry_report(
 
     match serde_json::to_string_pretty(&report) {
         Ok(json) => {
-            if let Err(e) = std::fs::write("logs/last_geometry.json", json) {
+            if let Err(e) = std::fs::write(path, json) {
                 tracing::warn!("Failed to write geometry report: {}", e);
             } else {
-                tracing::info!("📝 Geometry report written to logs/last_geometry.json");
+                tracing::info!("📝 Geometry report written to {}", path.display());
             }
         }
         Err(e) => tracing::warn!("Failed to serialise geometry report: {}", e),

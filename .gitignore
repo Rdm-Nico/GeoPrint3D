@@ -35,5 +35,10 @@ Thumbs.db
 *.log
 /backend/logs/
 
+# City regression harness: per-run outputs and raw-data snapshots (large)
+/backend/tests/cities/output/
+/backend/tests/cities/snapshots/
+__pycache__/
+
 #private
 /concepts

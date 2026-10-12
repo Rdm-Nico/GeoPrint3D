@@ -1,0 +1,114 @@
+{
+  "_comment": "Esperimenti 'what-if' sui DATI: ogni esperimento rigioca lo snapshot di una città applicando patch ai tag OSM grezzi (o eliminando elementi) PRIMA del parsing, con la pipeline invariata. Se una patch dei dati sistema il render, il difetto è (anche) nei dati; se nessun dato plausibile lo sistema, è l'algoritmo. Uso: run.sh --experiments [--only id1,id2]",
+  "experiments": [
+    {
+      "id": "st_peter_a_attuale",
+      "city": "rome_st_peter",
+      "description": "Dati attuali (v40 del 22/09/2026): height=\"136,5\" con la virgola, non letto → building:levels=5 → 16 m.",
+      "patches": []
+    },
+    {
+      "id": "st_peter_b_height54_v39",
+      "city": "rome_st_peter",
+      "description": "Dati precedenti alla modifica (v39 del 02/09/2026): height=54. È anche l'effetto della regola 'plinto' proposta (il tamburo 54–60 m è la part sospesa non supportata più grande).",
+      "patches": [
+        {
+          "element": "way/244159210",
+          "set": {
+            "height": "54"
+          }
+        }
+      ]
+    },
+    {
+      "id": "st_peter_c_height136_5_punto",
+      "city": "rome_st_peter",
+      "description": "Simula un parser tollerante alla virgola: height=136.5 (altezza TOTALE, semantica S3DB corretta) estrusa sull'intero outline.",
+      "patches": [
+        {
+          "element": "way/244159210",
+          "set": {
+            "height": "136.5"
+          }
+        }
+      ]
+    },
+    {
+      "id": "st_peter_d_senza_outline",
+      "city": "rome_st_peter",
+      "description": "Simula la regola S3DB pura ('se ci sono building:part l'outline non si renderizza'): l'outline viene eliminato.",
+      "patches": [
+        {
+          "element": "way/244159210",
+          "delete": true
+        }
+      ]
+    },
+    {
+      "id": "eiffel_a_attuale",
+      "city": "paris_eiffel",
+      "description": "Dati e regola attuali: le part coprono a terra il 25% (< 55%) → l'outline resta e diventa una piramide piena (roof:height=330).",
+      "patches": []
+    },
+    {
+      "id": "eiffel_b_senza_outline",
+      "city": "paris_eiffel",
+      "description": "Simula la regola S3DB (outline nascosto quando ci sono part; qui l'unione delle part copre il 100% dell'outline): l'outline 5013364 viene eliminato.",
+      "patches": [
+        {
+          "element": "way/5013364",
+          "delete": true
+        }
+      ]
+    },
+    {
+      "id": "paris_b_senza_outline_eiffel",
+      "city": "paris",
+      "description": "Come eiffel_b ma sulla bbox dell'utente (9.4 km², scala di stampa reale del concept Paris_2).",
+      "patches": [
+        {
+          "element": "way/5013364",
+          "delete": true
+        }
+      ]
+    },
+    {
+      "id": "rome_b_height54_v39",
+      "city": "rome",
+      "description": "Come st_peter_b ma sulla bbox dell'utente (4.7 km², scala del concept Rome_1).",
+      "patches": [
+        {
+          "element": "way/244159210",
+          "set": {
+            "height": "54"
+          }
+        }
+      ]
+    },
+    {
+      "id": "versailles_b_relazioni_intere",
+      "city": "versailles",
+      "description": "Simula la correzione proposta per le relazioni-edificio incomplete nei tile (Gate strict + ricarica intera, come già fatto per l'acqua): Château de Versailles (relazione 1149002, 33 membri) e Grand Trianon (12426409) iniettati interi da relation/{id}/full.json.",
+      "inject": [
+        "tests/cities/experiments_data/relation_1149002_full.json",
+        "tests/cities/experiments_data/relation_12426409_full.json"
+      ]
+    },
+    {
+      "id": "dubai_b_relazioni_intere",
+      "city": "dubai",
+      "description": "Come versailles_b: Dubai Mall (relazione 18195959) iniettato intero; oggi la prima copia (incompleta) la elimina e oscura quella completa del tile successivo.",
+      "inject": [
+        "tests/cities/experiments_data/relation_18195959_full.json"
+      ]
+    },
+    {
+      "id": "paris_c_relazioni_intere",
+      "city": "paris",
+      "description": "Come versailles_b: Palais de Chaillot (relazione 6826569) iniettato intero.",
+      "inject": [
+        "tests/cities/experiments_data/relation_6826569_full.json"
+      ]
+    }
+  ]
+}

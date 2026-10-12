@@ -356,7 +356,7 @@ impl TerrainIndex {
 /// The bridge module needs this: a deck must meet the surface as printed, and
 /// `TerrainIndex::nearest_z` next to a shore can return the recessed water
 /// copy of a vertex.
-pub(crate) struct TerrainSurface {
+pub struct TerrainSurface {
     tris: Vec<[[f32; 3]; 3]>,
     water: Vec<bool>,
     min_x: f32,
